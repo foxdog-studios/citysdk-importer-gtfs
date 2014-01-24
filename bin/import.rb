@@ -8,7 +8,6 @@ require 'tempfile'
 require 'getoptlong'
 
 require 'citysdk/importers/gtfs/util.rb'
-require 'citysdk/importers/gtfs/funcs.rb'
 
 $DB_name = ARGV[0]
 $DB_user = ARGV[1]
