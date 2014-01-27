@@ -224,7 +224,7 @@ AS $$
                         stop_times.departure_time,
                         '-5 minutes'::interval,
                         n
-                    ))
+                ))
                 OR (departs_within(
                     stop_times.departure_time,
                     '55 minutes'::interval,

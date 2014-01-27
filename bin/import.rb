@@ -1,45 +1,37 @@
 #!/usr/bin/env ruby
 
-require 'pg'
 require 'csv'
+require 'getoptlong'
 require 'json'
+require 'pg'
 require 'socket'
 require 'tempfile'
-require 'getoptlong'
-
 require 'citysdk/importers/gtfs/util.rb'
 
-$DB_name = ARGV[0]
-$DB_user = ARGV[1]
-$DB_pass = ARGV[2]
-
-$newDir = File.expand_path ARGV[3]
-$pg_csdk = nil
-$prefix = ''
 $quote = '"'
 
+$gtfs_files = [
+  'agency',
+  'calendar_dates',
+  'feed_info',
+  'routes',
+  'shapes',
+  'stop_times',
+  'stops',
+  'trips'
+]
 
-$gtfs_files = ['agency', 'feed_info', 'calendar_dates', 'stops', 'routes', 'trips', 'stop_times','shapes']
-
-def create_schema
-  # TODO: Sort out permissions for db_user for this.
-  $pg_csdk.exec("drop schema if exists igtfs cascade;")
-  $pg_csdk.exec("create schema igtfs;")
+def create_schema(conn)
+  conn.exec('DROP SCHEMA IF EXISTS igtfs CASCADE;')
+  conn.exec('CREATE SCHEMA igtfs;')
 end
 
-def get_columns(f)
-  a = nil
-  begin
-    File.open("#{$newDir}/#{f}.txt", "r:bom|utf-8") do |fd|
-      a = fd.gets.strip.split(',')
-    end
-  rescue
+def get_columns(data_dir, name)
+  path = File.join(data_dir, "#{name}.txt")
+  File.open(path) do |csv|
+    csv.gets.strip.split(',')
   end
-  a
 end
-
-
-
 
 $c_types = {
 
@@ -118,157 +110,217 @@ $c_types = {
 }
 
 
-def calendar_dates
-  one_file('calendar_dates')
-  $zrp.p "Merging calendar_dates.."
+def calendar_dates(conn, data_dir, prefix)
+  one_file(conn, data_dir, 'calendar_dates')
+  puts 'Merging calendar_dates...'
 
+  conn.exec('DROP INDEX IF EXISTS calendar_dates_service_id;')
 
-  $pg_csdk.exec "drop index if exists calendar_dates_service_id;"
-
-
-  $pg_csdk.exec <<-SQL
-    insert into gtfs.calendar_dates select
-      ('#{$prefix}' || service_id), date, exception_type
-    from igtfs.calendar_dates;
+  conn.exec <<-SQL
+    INSERT INTO gtfs.calendar_dates
+    SELECT ('#{prefix}' || service_id), date, exception_type
+    FROM igtfs.calendar_dates;
   SQL
 
-  $pg_csdk.exec "create table calendar_dates as select distinct * from gtfs.calendar_dates;"
-  $pg_csdk.exec "drop table gtfs.calendar_dates;"
-  $pg_csdk.exec "alter table calendar_dates set schema gtfs;"
-  $pg_csdk.exec "create index calendar_dates_service_id on gtfs.calendar_dates(service_id);"
-
+  conn.exec(
+    'CREATE TABLE calendar_dates AS SELECT DISTINCT * FROM gtfs.calendar_dates;'
+  )
+  conn.exec('DROP TABLE gtfs.calendar_dates;')
+  conn.exec('ALTER TABLE calendar_dates SET SCHEMA gtfs;')
+  conn.exec(
+    'CREATE INDEX calendar_dates_service_id ON gtfs.calendar_dates(service_id);'
+  )
 end
 
 
-def stops
-  cls = one_file('stops')
+def stops(conn, data_dir, prefix)
+  columns = one_file(conn, data_dir, 'stops')
 
-  $zrp.p "Merging stops.."
+  puts 'Merging stops...'
 
   select = "i.stop_name"
-  select += cls.include?('location_type') ? ",i.location_type" : ", 0"
-  select += cls.include?('parent_station') ? ",i.parent_station" : ", ''"
-  select += cls.include?('platform_code') ? ", i.platform_code" : ", ''"
+  select += columns.include?('location_type') ? ",i.location_type" : ", 0"
+  select += columns.include?('parent_station') ? ",i.parent_station" : ", ''"
+  select += columns.include?('platform_code') ? ", i.platform_code" : ", ''"
   select += ",i.location"
-  select += cls.include?('wheelchair_boarding') ? ", i.wheelchair_boarding" : ", 0"
+  select += columns.include?('wheelchair_boarding') ? ", i.wheelchair_boarding" : ", 0"
 
   select2 = "stop_id,stop_name,location_type,parent_station, wheelchair_boarding, platform_code,location"
-  select2.gsub!('location_type',"0") if !cls.include?('location_type')
-  select2.gsub!('parent_station',"''") if !cls.include?('parent_station')
-  select2.gsub!('wheelchair_boarding',"0") if !cls.include?('wheelchair_boarding')
-  select2.gsub!('platform_code',"''") if !cls.include?('platform_code')
+  select2.gsub!('location_type',"0") if !columns.include?('location_type')
+  select2.gsub!('parent_station',"''") if !columns.include?('parent_station')
+  select2.gsub!('wheelchair_boarding',"0") if !columns.include?('wheelchair_boarding')
+  select2.gsub!('platform_code',"''") if !columns.include?('platform_code')
 
+  conn.exec('ALTER TABLE igtfs.stops ADD COLUMN location geometry(point,4326)')
+  conn.exec(
+    "UPDATE igtfs.stops SET (stop_id, location) = ('#{prefix}' || stop_id, " \
+    'ST_SetSRID(ST_Point(stop_lon,stop_lat),4326))'
+  )
 
-  $pg_csdk.exec "alter table igtfs.stops add column location geometry(point,4326)"
-  $pg_csdk.exec "update igtfs.stops set (stop_id,location) = ('#{$prefix}' || stop_id, ST_SetSRID(ST_Point(stop_lon,stop_lat),4326))"
-  $pg_csdk.exec "update igtfs.stops set parent_station = '' where parent_station is NULL" if cls.include?('parent_station')
-  $pg_csdk.exec "update igtfs.stops set wheelchair_boarding = 0 where wheelchair_boarding is NULL" if cls.include?('wheelchair_boarding')
-  $pg_csdk.exec "update igtfs.stops set platform_code = '' where platform_code is NULL" if cls.include?('platform_code')
-  $pg_csdk.exec "update igtfs.stops set location_type = 0 where location_type is NULL" if cls.include?('location_type')
-
-  $pg_csdk.exec <<-SQL
-    WITH upsert as
-    (update gtfs.stops g set
-      (stop_name,location_type,parent_station,platform_code,location,wheelchair_boarding) =
-      (#{select})
-      from igtfs.stops i where g.stop_id=i.stop_id
-        returning g.stop_id
+  if columns.include?('parent_station')
+    conn.exec(
+      "UPDATE igtfs.stops SET parent_station = '' WHERE parent_station IS NULL"
     )
-    insert into gtfs.stops select
-      #{select2}
-    from igtfs.stops a where a.stop_id not in (select stop_id from upsert);
+  end
+
+  if columns.include?('wheelchair_boarding')
+    conn.exec(
+      'UPDATE igtfs.stops SET wheelchair_boarding = 0 ' \
+      'WHERE wheelchair_boarding IS NULL'
+    )
+  end
+
+  if columns.include?('platform_code')
+    conn.exec(
+      "UPDATE igtfs.stops SET platform_code = '' WHERE platform_code IS NULL"
+    )
+  end
+
+  if columns.include?('location_type')
+    conn.exec(
+      'UPDATE igtfs.stops SET location_type = 0 WHERE location_type IS NULL'
+    )
+  end
+
+  conn.exec <<-SQL
+    WITH upsert AS (
+      UPDATE gtfs.stops g SET (
+        stop_name,
+        location_type,
+        parent_station,
+        platform_code,
+        location,
+        wheelchair_boarding
+      ) = (#{select})
+      FROM igtfs.stops i WHERE g.stop_id = i.stop_id
+      RETURNING g.stop_id
+    )
+    INSERT INTO gtfs.stops
+      SELECT #{select2}
+      FROM igtfs.stops a
+      WHERE a.stop_id NOT IN (SELECT stop_id FROM upsert);
   SQL
 end
 
+def agency(conn, data_dir)
+  columns = one_file(conn, data_dir, 'agency')
+  return unless columns
+  puts "Merging agency.."
 
-#agency_id,agency_name,agency_url,agency_timezone
+  select  = "agency_id,agency_name,agency_url,agency_timezone,agency_lang"
+  iselect = "i.agency_name,i.agency_url,i.agency_timezone,i.agency_lang"
 
-def agency
-  cls = one_file('agency')
-  if cls
-    $zrp.p "Merging agency.."
-
-    select  = "agency_id,agency_name,agency_url,agency_timezone,agency_lang"
-    iselect = "i.agency_name,i.agency_url,i.agency_timezone,i.agency_lang"
-
-    if !cls.include?('agency_lang')
-      select.gsub!('agency_lang',"''")
-      iselect.gsub!('i.agency_lang',"''")
-    end
-
-    $pg_csdk.exec <<-SQL
-      WITH upsert as
-      (update gtfs.agency g set
-        (agency_name,agency_url,agency_timezone,agency_lang) =
-        (#{iselect})
-        from igtfs.agency i where g.agency_id=i.agency_id
-          returning g.agency_id
-      )
-      insert into gtfs.agency select
-        #{select}
-      from igtfs.agency a where a.agency_id not in (select agency_id from upsert);
-    SQL
+  if !columns.include?('agency_lang')
+    select.gsub!('agency_lang', "''")
+    iselect.gsub!('i.agency_lang', "''")
   end
+
+  conn.exec <<-SQL
+    WITH upsert AS (
+      UPDATE gtfs.agency g SET (
+        agency_name,
+        agency_url,
+        agency_timezone,
+        agency_lang
+      ) = (#{iselect})
+      FROM igtfs.agency i WHERE g.agency_id = i.agency_id
+      RETURNING g.agency_id
+    )
+    INSERT INTO gtfs.agency
+    SELECT #{select}
+    FROM igtfs.agency a
+    WHERE a.agency_id NOT IN (
+      SELECT agency_id FROM upsert
+    );
+  SQL
 end
 
-
-def shapes
-  cls = one_file('shapes')
-  if cls
-    $zrp.p "Merging shapes.."
-    $pg_csdk.exec <<-SQL
-      delete from gtfs.shapes g
-      where g.shape_id in (select distinct shape_id from igtfs.shapes);
-      insert into gtfs.shapes select
-        shape_id,shape_pt_lat,shape_pt_lon,shape_pt_sequence
-      from igtfs.shapes;
-    SQL
+def shapes(conn, data_dir)
+  unless File.file?(File.join(data_dir, 'shapes.txt'))
+    return
   end
+
+  puts 'Merging shapes...'
+  columns = one_file(conn, data_dir, 'shapes')
+
+  conn.exec <<-SQL
+    DELETE FROM gtfs.shapes g
+      WHERE g.shape_id IN (
+        SELECT DISTINCT shape_id FROM igtfs.shapes
+      );
+
+    INSERT INTO gtfs.shapes
+      SELECT shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence
+      FROM igtfs.shapes;
+  SQL
 end
 
-
-def feed_info
-  cls = one_file('feed_info')
-  if cls
-    a = []
-    CSV.foreach("#{$newDir}/agency.txt", :quote_char => '"', :col_sep =>',',:headers => true, :row_sep =>:auto) do |row|
-      a << row['agency_name']
-    end
-    a = $pg_csdk.escape(a.join(', '))
-
-    select = "feed_publisher_name,feed_publisher_url,feed_lang,feed_start_date,feed_end_date,feed_version,'#{a}','#{Time.now.strftime('%Y-%m-%d')}'"
-    select.gsub!('feed_end_date','feed_valid_to') if cls.include?('feed_valid_to')
-    select.gsub!('feed_start_date','feed_valid_from') if cls.include?('feed_valid_from')
-
-    $pg_csdk.exec <<-SQL
-      delete from gtfs.feed_info g
-      using igtfs.feed_info i
-      where g.feed_version = i.feed_version;
-      insert into gtfs.feed_info select
-        #{select}
-      from igtfs.feed_info;
-    SQL
+def feed_info(conn, data_dir)
+  unless File.file?(File.join(data_dir, 'feed_info'))
+    return
   end
+
+  columns = one_file(conn, data_dir, 'feed_info')
+  return unless columns
+
+  a = []
+  CSV.foreach(
+    File.join(data_dir, 'agency.txt'),
+    :quote_char => '"',
+    :col_sep =>',',
+    :headers => true,
+    :row_sep =>:auto
+  ) do |row|
+    a << row['agency_name']
+  end
+  a = conn.escape(a.join(', '))
+
+  select = [
+    'feed_publisher_name',
+    'feed_publisher_url',
+    'feed_lang',
+    'feed_start_date',
+    'feed_end_date',
+    'feed_version',
+    a,
+    Time.now.strftime('%Y-%m-%d')
+  ].join(',')
+
+  if columns.include?('feed_valid_to')
+    select.gsub!('feed_end_date', 'feed_valid_to')
+  end
+
+  if columns.include?('feed_valid_from')
+    select.gsub!('feed_start_date', 'feed_valid_from')
+  end
+
+  conn.exec <<-SQL
+    DELETE FROM gtfs.feed_info g USING igtfs.feed_info i
+      WHERE g.feed_version = i.feed_version;
+    INSERT INTO gtfs.feed_info select #{select} FROM igtfs.feed_info;
+  SQL
 end
 
-
-def routes
-  cls = one_file('routes')
-
-  $zrp.p "Merging routes.."
+def routes(conn, data_dir, prefix)
+  columns = one_file(conn, data_dir, 'routes')
+  puts "Merging routes.."
 
   select  = "route_id,agency_id,route_short_name,route_long_name,route_type"
   iselect = "i.agency_id,i.route_short_name,i.route_long_name,i.route_type"
-  if !cls.include?('agency_id')
-    select.gsub!('agency_id',"''")
-    iselect.gsub!('i.agency_id',"''")
+  unless columns.include?('agency_id')
+    select.gsub!('agency_id', "''")
+    iselect.gsub!('i.agency_id', "''")
   end
 
-  $pg_csdk.exec "update igtfs.routes set (route_id) = ('#{$prefix}' || route_id)"
+  conn.exec("UPDATE igtfs.routes SET (route_id) = ('#{prefix}' || route_id)")
 
-  $pg_csdk.exec "update igtfs.routes set route_short_name = route_long_name where route_short_name is NULL"
+  conn.exec <<-SQL
+    UPDATE igtfs.routes
+    SET route_short_name = route_long_name
+    WHERE route_short_name is NULL
+  SQL
 
-  $pg_csdk.exec <<-SQL
+  conn.exec <<-SQL
     WITH upsert as
     (update gtfs.routes g set
       (agency_id,route_short_name,route_long_name,route_type) =
@@ -282,170 +334,166 @@ def routes
   SQL
 end
 
+def stop_times(conn, data_dir, prefix)
+  columns = one_file(conn, data_dir, 'stop_times')
 
-def stop_times
-  cls = one_file('stop_times')
+  conn.exec('DROP INDEX IF EXISTS gtfs.stop_times_trip_id;')
+  conn.exec('DROP INDEX IF EXISTS gtfs.stop_times_stop_id;')
+  conn.exec('DROP INDEX IF EXISTS gtfs.stop_times_departure_time;')
+  conn.exec('DROP INDEX IF EXISTS gtfs.stop_times_stop_id_trip_id;')
 
-  $pg_csdk.exec "drop index if exists gtfs.stop_times_trip_id;"
-  $pg_csdk.exec "drop index if exists gtfs.stop_times_stop_id;"
-  $pg_csdk.exec "drop index if exists gtfs.stop_times_departure_time;"
-  $pg_csdk.exec "drop index if exists gtfs.stop_times_stop_id_trip_id;"
+  select = (
+    "'#{prefix}' || trip_id, arrival_time, departure_time, "
+    "'#{prefix}' || stop_id, stop_sequence, stop_headsign, "
+    "pickup_type, drop_off_type"
+  )
 
-  select = "'#{$prefix}' || trip_id, arrival_time, departure_time, '#{$prefix}' || stop_id, stop_sequence, stop_headsign, pickup_type, drop_off_type"
-  select.gsub!('stop_headsign',"''") if !cls.include?('stop_headsign')
-  select.gsub!('pickup_type','0') if !cls.include?('pickup_type')
-  select.gsub!('drop_off_type','0') if !cls.include?('drop_off_type')
+  select.gsub!('stop_headsign', "''") unless columns.include?('stop_headsign')
+  select.gsub!('pickup_type', '0') unless columns.include?('pickup_type')
+  select.gsub!('drop_off_type', '0') unless columns.include?('drop_off_type')
 
-  $zrp.p "Merging stop_times.."
-  $pg_csdk.exec <<-SQL
-    insert into gtfs.stop_times select
-      #{select}
-    from igtfs.stop_times;
+  puts 'Merging stop_times...'
+  conn.exec(
+    "INSERT INTO gtfs.stop_times SELECT #{select} FROM igtfs.stop_times;"
+  )
+
+  conn.exec(
+    'CREATE TABLE stop_times AS SELECT DISTINCT * FROM gtfs.stop_times;'
+  )
+  conn.exec('DROP TABLE gtfs.stop_times;')
+  conn.exec('ALTER TABLE stop_times SET SCHEMA gtfs;')
+
+  puts 'Creating index on stop_times(stop_id,trip_id)...'
+  conn.exec <<-SQL
+    CREATE INDEX stop_times_stop_id_trip_id
+    ON gtfs.stop_times
+    USING btree(trip_id, stop_id);
   SQL
 
-  $pg_csdk.exec "create table stop_times as select distinct * from gtfs.stop_times;"
-  $pg_csdk.exec "drop table gtfs.stop_times;"
-  $pg_csdk.exec "alter table stop_times set schema gtfs;"
+  puts 'Creating index on stop_times(trip_id)...'
+  conn.exec('CREATE INDEX stop_times_trip_id ON gtfs.stop_times(trip_id);')
 
+  puts 'Creating index on stop_times(stop_id)...'
+  conn.exec('CREATE INDEX stop_times_stop_id ON gtfs.stop_times(stop_id);')
 
-  $zrp.p "Create index stop_times(stop_id,trip_id).."
-  $pg_csdk.exec "create index stop_times_stop_id_trip_id on gtfs.stop_times using btree(trip_id, stop_id);"
-  $zrp.p "Create index stop_times(trip_id).."
-  $pg_csdk.exec "create index stop_times_trip_id on gtfs.stop_times(trip_id);"
-  $zrp.p "Create index stop_times(stop_id).."
-  $pg_csdk.exec "create index stop_times_stop_id on gtfs.stop_times(stop_id);"
-  $zrp.p "Create index stop_times(departure_time).."
-  $pg_csdk.exec "create index stop_times_departure_time on gtfs.stop_times(departure_time);"
-
+  puts 'Creating index on stop_times(departure_time)...'
+  conn.exec(
+    'CREATE INDEX stop_times_departure_time ON gtfs.stop_times(departure_time);'
+  )
 end
 
+def trips(conn, data_dir, prefix)
+  columns = one_file(conn, data_dir, 'trips')
+  return unless columns
 
+  puts "Merging trips.."
 
-def trips
-  cls = one_file('trips')
-  if(cls)
-    select = "'#{$prefix}' || route_id, '#{$prefix}' || service_id, '#{$prefix}' || trip_id"
-    select += cls.include?('trip_headsign') ? ", trip_headsign" : ", ''"
-    select += cls.include?('direction_id') ? ", direction_id" : ", 0"
-    select += cls.include?('wheelchair_accessible') ? ", wheelchair_accessible" : ", 0"
-    select += cls.include?('trip_bikes_allowed') ? ", trip_bikes_allowed" : ", 0"
-    select += cls.include?('shape_id') ? ", '#{$prefix}' || shape_id" : ", ''"
+  select = "'#{prefix}' || route_id, '#{prefix}' || service_id, '#{prefix}' || trip_id"
+  select += columns.include?('trip_headsign') ? ", trip_headsign" : ", ''"
+  select += columns.include?('direction_id') ? ", direction_id" : ", 0"
+  select += columns.include?('wheelchair_accessible') ? ", wheelchair_accessible" : ", 0"
+  select += columns.include?('trip_bikes_allowed') ? ", trip_bikes_allowed" : ", 0"
+  select += columns.include?('shape_id') ? ", '#{prefix}' || shape_id" : ", ''"
 
-    $pg_csdk.exec "update igtfs.trips set direction_id = 0 where direction_id is NULL" if cls.include?('direction_id')
-
-    $zrp.p "Merging trips.."
-
-    $pg_csdk.exec <<-SQL
-      insert into gtfs.trips select
-        #{select}
-      from igtfs.trips;
-    SQL
-
-    $pg_csdk.exec "create table trips as select distinct * from gtfs.trips;"
-    $pg_csdk.exec "drop table gtfs.trips;"
-    $pg_csdk.exec "alter table trips set schema gtfs;"
-    $pg_csdk.exec "create index trips_trip_id on gtfs.trips(trip_id);"
-    $pg_csdk.exec "create index trips_route_id on gtfs.trips(route_id);"
-    $pg_csdk.exec "create index trips_direction_id on gtfs.trips(direction_id);"
-
+  if columns.include?('direction_id')
+    conn.exec(
+      'UPDATE igtfs.trips SET direction_id = 0 WHERE direction_id is NULL'
+    )
   end
+
+  conn.exec("INSERT INTO gtfs.trips SELECT #{select} FROM igtfs.trips;")
+  conn.exec('CREATE TABLE trips as SELECT DISTINCT * FROM gtfs.trips;')
+  conn.exec('DROP TABLE gtfs.trips;')
+  conn.exec('ALTER TABLE trips SET SCHEMA gtfs;')
+  conn.exec('CREATE INDEX trips_trip_id ON gtfs.trips(trip_id);')
+  conn.exec('CREATE INDEX trips_route_id ON gtfs.trips(route_id);')
+  conn.exec('CREATE INDEX trips_direction_id ON gtfs.trips(direction_id);')
 end
 
+def one_file(conn, data_dir, name)
+  puts "Copying #{name} from disk..."
 
+  columns = get_columns(data_dir, name)
+  return unless columns
 
-def one_file(f)
-
-  $zrp.n
-  $zrp.p "Copying #{f} from disk.."
-
-  columns = get_columns(f)
-  if(columns)
-    ca = []
-    columns.each do |c|
-      ca << "#{c} #{$c_types[f][c] || 'text'}"
-    end
-    $pg_csdk.exec "create table igtfs.#{f} (#{ca.join(',')})"
-
-    $pg_csdk.exec "copy igtfs.#{f} from stdin QUOTE '#{$quote}' CSV HEADER"
-    File.open("#{$newDir}/#{f}.txt", "r").each_line do |line|
-       fail unless $pg_csdk.put_copy_data line
-    end
-    fail unless $pg_csdk.put_copy_end
-    columns
+  ca = columns.map do |column|
+    column_type = $c_types[name][column] || 'text'
+    "#{column} #{column_type}"
   end
+
+  ca = ca.join(',')
+  conn.exec("CREATE table igtfs.#{name} (#{ca})")
+  conn.exec("COPY igtfs.#{name} FROM stdin QUOTE '#{$quote}' CSV HEADER")
+
+  path = File.join(data_dir, "#{name}.txt")
+  File.open(path, 'r').each_line do |line|
+     fail unless conn.put_copy_data line
+  end
+
+  fail unless conn.put_copy_end
+  columns
 end
 
-
-def copy_tables()
-  create_schema
-  feed_info
-  agency
-  calendar_dates
-  routes
-  trips
-  stops
-  stop_times
-  shapes
+def copy_tables(conn, data_dir, prefix)
+  create_schema(conn)
+  feed_info(conn, data_dir)
+  agency(conn, data_dir)
+  calendar_dates(conn, data_dir, prefix)
+  routes(conn, data_dir, prefix)
+  trips(conn, data_dir, prefix)
+  stops(conn, data_dir, prefix)
+  stop_times(conn, data_dir, prefix)
+  shapes(conn, data_dir)
 end
 
-
-
-
-class Zrp
-  def initialize() $stderr.write "\033[s" end
-  def p(s) $stderr.puts "\033[u\033[A\033[K#{s}" end
-  def n() $stderr.write "\n\033[s" end
-end
-$zrp = Zrp.new
-
-
-
-def do_stops
-
-  $zrp.n
-  $zrp.p "Mapping stops.."
-
+def do_stops(conn, layer_id, data_dir, prefix)
+  puts 'Mapping stops..'
 
   stops_a = []
 
-  CSV.open("#{$newDir}/stops.txt", 'r:bom|utf-8', :quote_char => '"', :col_sep =>',',:headers => true, :row_sep =>:auto) do |csv|
+  CSV.open(
+    File.join(data_dir, 'stops.txt'),
+    'r:bom|utf-8',
+    :quote_char => '"',
+    :col_sep =>',',
+    :headers => true,
+    :row_sep => :auto
+  ) do |csv|
     csv.each do |row|
-      s = $prefix + row['stop_id']
+      s = prefix + row['stop_id']
       stops_a << "'#{s}'"
     end
   end
 
-
-
-  stops = $pg_csdk.exec("select * from gtfs.stops where stop_id in (#{stops_a.join(',')}) order by stop_name");
+  stops_a_csv = stops_a.join(',')
+  stops = conn.exec(
+    "SELECT * FROM gtfs.stops WHERE stop_id IN (#{stops_a_csv}) " \
+    'ORDER BY stop_name'
+  );
   stopsCount = stops.cmdtuples
-  $zrp.n
-  $zrp.n
 
   stops.each do |stop|
-    nid = GTFS_Import::stopNode(stop)
-    GTFS_Import::stopNodeData(nid, stop) if nid
-    $zrp.p "#{stopsCount}; #{stop['stop_name']}" if stopsCount % 100 == 0
+    nid = GTFS_Import::stopNode(conn, layer_id, stop)
+    GTFS_Import::stopNodeData(conn, layer_id, nid, stop) if nid
+    if stopsCount % 100 == 0
+      puts "#{stopsCount}; #{stop['stop_name']}"
+    end
     stopsCount -= 1
   end
-
-
 end
 
-def do_routes
-
-  $zrp.n
-  $zrp.p "Mapping routes.."
+def do_routes(conn, layer_id, data_dir, prefix)
+  puts 'Mapping routes...'
 
   @val=nil
 
-  if $gtfs_files.include?('feed_info')
-
-    File.open("#{$newDir}/feed_info.txt", 'r:bom|utf-8') do |f|
-      h = f.gets.chomp.split(',') #headers
-      sd = h.index('feed_start_date') || h.index('feed_valid_from')
-      ed = h.index('feed_end_date') || h.index('feed_valid_to')
-      if( sd && ed)
+  path = File.join(data_dir, 'feed_info.txt')
+  if File.file?(path)
+    File.open(path) do |f|
+      headers = f.gets.chomp.split(',')
+      sd = headers.index('feed_start_date') || headers.index('feed_valid_from')
+      ed = headers.index('feed_end_date') || headers.index('feed_valid_to')
+      if sd && ed
         s = f.gets.chomp.split(',')
         sd = s[sd] + " 00:00"
         ed = s[ed] + " 23:59"
@@ -456,164 +504,170 @@ def do_routes
 
   $routes_rejected = 0
 
-  route_a = []
-
-  CSV.open("#{$newDir}/routes.txt", 'r:bom|utf-8', :quote_char => '"', :col_sep =>',',:headers => true, :row_sep =>:auto) do |csv|
-    csv.each do |row|
-      r = $prefix + row['route_id']
-      route_a << "'#{r}'"
+  route_a = CSV.open(
+    File.join(data_dir, 'routes.txt'),
+    'r:bom|utf-8',
+    :quote_char => '"',
+    :col_sep =>',',
+    :headers => true,
+    :row_sep =>:auto
+  ) do |csv|
+    csv.map do |row|
+      "'#{prefix}#{row['route_id']}'"
     end
   end
 
-  routes = $pg_csdk.exec("select * from gtfs.routes where route_id in (#{route_a.join(',')})");
+  route_a_csv = route_a.join(',')
+  routes = conn.exec(
+    "SELECT * FROM gtfs.routes WHERE route_id IN (#{route_a_csv})"
+  )
 
+  num_routes_to_add = routes.cmdtuples
 
-  totalRoutes = routes.cmdtuples
-
-  $zrp.n
   routes.each do |route|
-    $zrp.p "#{totalRoutes}; #{route['route_id']}; #{route['route_short_name']}; #{route['route_long_name']}"
-    totalRoutes -= 1
-    GTFS_Import::addOneRoute(route,0,@val)
-    GTFS_Import::addOneRoute(route,1,@val)
-  end
+    puts [
+      num_routes_to_add,
+      route['route_id'],
+      route['route_short_name'],
+      route['route_long_name']
+    ].join('; ')
 
-end
-
-
-
-def do_cleanup
-
-  $zrp.n
-  $zrp.p "Cleaning up.."
-
-  $zrp.p "Collecting old trips.."
-
-  $pg_csdk.exec <<-SQL
-    select trip_id,service_id into temporary cu_tripids from gtfs.trips where
-      service_id in (
-        select distinct service_id from gtfs.calendar_dates where date <= (now() - '2 days'::interval)
-      );
-  SQL
-
-  $zrp.p "Removing still valid trips from collection.."
-  $pg_csdk.exec <<-SQL
-    delete from  cu_tripids where
-      service_id in (
-       select distinct service_id from gtfs.calendar_dates where date > (now() - '2 days'::interval)
-      );
-  SQL
-
-  $zrp.p "Deleting old stoptimes.."
-  $pg_csdk.exec <<-SQL
-    delete from gtfs.stop_times where trip_id in
-      ( select distinct trip_id from cu_tripids );
-  SQL
-
-  $zrp.p "Deleting obsolete trips.."
-  $pg_csdk.exec <<-SQL
-    delete from gtfs.trips where trip_id in
-      ( select distinct trip_id from cu_tripids );
-  SQL
-
-  $zrp.p "Deleting old calendar date entries.."
-  $pg_csdk.exec <<-SQL
-    delete from gtfs.calendar_dates where date <= (now() - '2 days'::interval);
-  SQL
-
-end
-
-
-opts = GetoptLong.new(
-  [ '--prefix', '-p', GetoptLong::REQUIRED_ARGUMENT ]
-)
-
-
-opts.each do |opt, arg|
-  case opt
-    when '--prefix'
-      $prefix = arg
+    num_routes_to_add -= 1
+    GTFS_Import::addOneRoute(conn, layer_id, route, 0, @val, prefix)
+    GTFS_Import::addOneRoute(conn, layer_id, route, 1, @val, prefix)
   end
 end
 
-if (!File.directory?($newDir) or !$DB_name or !$DB_pass or !$DB_user)
-  puts "database data or gtfs directory missing..."
-  exit 0
+def do_cleanup(conn)
+  puts 'Cleaning up...'
+
+  puts 'Collecting old trips..'
+  conn.exec <<-SQL
+    SELECT
+      trip_id,
+      service_id
+    INTO TEMPORARY cu_tripids
+    FROM gtfs.trips
+    WHERE service_id in (
+      SELECT DISTINCT service_id
+      FROM gtfs.calendar_dates
+      WHERE date <= (now() - '2 days'::interval)
+    );
+  SQL
+
+  puts 'Removing still valid trips from collection...'
+  conn.exec <<-SQL
+    DELETE FROM cu_tripids
+    WHERE service_id IN (
+      SELECT DISTINCT service_id
+      FROM gtfs.calendar_dates
+      WHERE date > (now() - '2 days'::interval)
+    );
+  SQL
+
+  puts 'Deleting old stoptimes...'
+  conn.exec <<-SQL
+    DELETE FROM gtfs.stop_times
+    WHERE trip_id IN (
+      SELECT DISTINCT trip_id
+      FROM cu_tripids
+    );
+  SQL
+
+  puts 'Deleting obsolete trips...'
+  conn.exec <<-SQL
+    DELETE FROM gtfs.trips
+    WHERE trip_id IN (
+      SELECT DISTINCT trip_id
+      FROM cu_tripids
+    );
+  SQL
+
+  puts 'Deleting old calendar date entries...'
+  conn.exec <<-SQL
+    DELETE FROM gtfs.calendar_dates
+    WHERE DATE <= (now() - '2 days'::interval);
+  SQL
 end
 
-$gtfs_files.each do |f|
-  if f == 'shapes' and !File.exists? "#{$newDir}/#{f}.txt"
-    $gtfs_files.delete(f)
-    next
-  end
+def main(argv)
+  opts = GetoptLong.new(
+    ['--prefix', '-p', GetoptLong::REQUIRED_ARGUMENT]
+  )
 
-  if f == 'feed_info' and !File.exists? "#{$newDir}/#{f}.txt"
-    $gtfs_files.delete(f)
-    next
-  end
-
-  if !File.exists? "#{$newDir}/#{f}.txt"
-    puts "Bad or incomplete GTFS structure in #{$newDir}."
-    exit(1)
-  end
-end
-
-
-begin
-  $pg_csdk = PGconn.new('localhost', '5432', nil, nil, $DB_name, $DB_user, $DB_pass)
-
-  res = $pg_csdk.exec("select id from layers where name = 'gtfs'");
-  $gtfs_layerID = res[0]['id'].to_i if res.cmdtuples > 0
-  if($gtfs_layerID.nil?)
-    $stderr.puts "No gtfs layer found!"
-    exit(-1)
-  end
-
-  GTFS_Import::do_log("Starting update: prefix: #{$prefix}")
-
-  $pg_csdk.transaction do
-    begin
-      GTFS_Import::cons_calendartxt
-      copy_tables
-    rescue Exception => e
-      $stderr.puts e.message
-      $stderr.puts "\nROLLBACK (copy tables)"
-      exit(1)
+  prefix = ''
+  opts.each do |opt, arg|
+    case opt
+      when '--prefix'
+        prefix = arg
     end
   end
 
-  GTFS_Import::do_log("\tCommited copy gtfs.")
+  database = argv[0]
+  user = argv[1]
+  password = argv[2]
+  data_dir = File.expand_path(argv[3])
 
-  $pg_csdk.transaction do
-    begin
-      do_cleanup
-    rescue Exception => e
-      $stderr.puts e.message
-      $stderr.puts "\nROLLBACK (cleanup)"
-      exit(1)
+  unless File.directory?(data_dir)
+    puts "GTFS data directory missing, aborting"
+    return 1
+  end
+
+  unless database && user && password
+    puts "Database credentials missing, aborting"
+    return 1
+  end
+
+  optional = ['feed_info', 'shapes']
+
+  $gtfs_files.each do |name|
+    path = File.join(data_dir, "#{name}.txt")
+
+    unless File.exists?(path)
+      if optional.include?(name)
+        $gtfs_files.delete(name)
+      else
+        puts "Bad or incomplete GTFS data set in #{data_dir}, aborting!"
+        return 1
+      end
     end
   end
 
-  GTFS_Import::do_log("\tCommited cleanup.")
+  conn = PGconn.new('localhost', '5432', nil, nil, database, user, password)
 
-  $pg_csdk.transaction do
-    begin
-      do_stops
-      do_routes
-    rescue Exception => e
-      $stderr.puts e.message
-      $stderr.puts "\nROLLBACK (map stops & routes)"
-      exit(1)
-    end
+  res = conn.exec("SELECT id FROM layers WHERE name = 'gtfs'");
+  if res.cmdtuples == 0
+    puts 'No GTFS layer found, aborting!'
+    return 1
   end
 
-  GTFS_Import::do_log("\tCommited stops and routes mapping.")
+  layer_id = res[0]['id'].to_i
 
-  $stderr.puts "\nCOMMIT"
+  puts "Starting update: prefix: #{prefix}"
+  conn.transaction do
+    GTFS_Import::cons_calendartxt
+    copy_tables(conn, data_dir, prefix)
+  end
 
-rescue Exception => e
-  puts e.message
+  puts "\tCommitted copy gtfs."
+  conn.transaction do
+    do_cleanup(conn)
+  end
+
+  puts "\tCommitted cleanup."
+  conn.transaction do
+    do_stops(conn, layer_id, data_dir, prefix)
+    do_routes(conn, layer_id, data_dir, prefix)
+  end
+
+  puts 'Committed stops and routes mapping.'
+
+  return 0
 ensure
-  $pg_csdk.close
+  conn.close unless conn.nil?
+end
+
+if __FILE__ == $0
+  exit main(ARGV)
 end
 
