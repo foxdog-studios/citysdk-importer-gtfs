@@ -1,4 +1,12 @@
 -- -----------------------------------------------------------------------------
+-- - Preamble                                                                  -
+-- -----------------------------------------------------------------------------
+
+\set ECHO all
+\set ON_ERROR_STOP on
+
+
+-- -----------------------------------------------------------------------------
 -- - Schema                                                                    -
 -- -----------------------------------------------------------------------------
 
@@ -9,78 +17,161 @@ CREATE SCHEMA gtfs;
 -- - Tables                                                                    -
 -- -----------------------------------------------------------------------------
 
-CREATE TABLE gtfs.agency (
-    agency_id             TEXT      PRIMARY KEY,
-    agency_name           TEXT,
-    agency_url            TEXT,
-    agency_timezone       TEXT,
-    agency_lang           TEXT
+-- CitySDK table
+CREATE TABLE gtfs.feed (
+    gtfs_id       TEXT PRIMARY KEY,
+    uri           TEXT NOT NULL UNIQUE,
+    last_imported TIMESTAMP WITH TIME ZONE
 );
 
-CREATE TABLE gtfs.calendar_dates (
-    service_id            TEXT,
-    date                  DATE,
-    exception_type        SMALLINT
-);
 
 CREATE TABLE gtfs.feed_info (
-    feed_publisher_name   TEXT,
-    feed_publisher_url    TEXT,
-    feed_lang             TEXT,
-    feed_start_date       DATE,
-    feed_end_date         DATE,
-    feed_version          TEXT,
-    agencies              TEXT,
-    date_added            TEXT
+    gtfs_id             TEXT PRIMARY KEY,
+
+    feed_publisher_name TEXT NOT NULL,
+    feed_publisher_url  TEXT NOT NULL,
+    feed_timezone       TEXT NOT NULL,
+    feed_lang           TEXT,
+    feed_valid_from     DATE,
+    feed_valid_to       DATE,
+    feed_version        TEXT,
+
+    FOREIGN KEY (gtfs_id)
+        REFERENCES gtfs.feed
+        ON DELETE CASCADE
 );
+
+
+CREATE TABLE gtfs.agency (
+    gtfs_id TEXT NOT NULL,
+
+    agency_id TEXT NOT NULL,
+    agency_name TEXT NOT NULL,
+    agency_url TEXT NOT NULL,
+    agency_timezone TEXT NOT NULL,
+    agency_lang TEXT,
+
+    PRIMARY KEY (gtfs_id, agency_id),
+
+    FOREIGN KEY (gtfs_id)
+        REFERENCES gtfs.feed
+        ON DELETE CASCADE
+);
+
 
 CREATE TABLE gtfs.routes (
-    route_id              TEXT      PRIMARY KEY,
-    agency_id             TEXT,
-    route_short_name      TEXT,
-    route_long_name       TEXT,
-    route_type            SMALLINT
+    gtfs_id          TEXT NOT NULL,
+
+    route_id         TEXT NOT NULL,
+    agency_id        TEXT,
+    route_short_name TEXT NOT NULL,
+    route_long_name  TEXT NOT NULL,
+    route_desc       TEXT,
+    route_type       SMALLINT NOT NULL CHECK (route_type BETWEEN 0 AND 7),
+    route_url        TEXT,
+    route_color      TEXT,
+    route_text_color TEXT,
+
+    PRIMARY KEY (gtfs_id, route_id),
+
+    FOREIGN KEY (gtfs_id, agency_id)
+        REFERENCES gtfs.agency (gtfs_id, agency_id)
+        ON DELETE CASCADE
 );
+
 
 CREATE TABLE gtfs.shapes (
-    shape_id              TEXT,
-    shape_pt_lat          TEXT,
-    shape_pt_lon          TEXT,
-    shape_pt_sequence     INTEGER
+    gtfs_id TEXT NOT NULL,
+
+    shape_id TEXT NOT NULL,
+    shape_pt_lat TEXT NOT NULL,
+    shape_pt_lon TEXT NOT NULL,
+    shape_pt_sequence INTEGER NOT NULL,
+    shape_dist_traveled NUMERIC,
+
+    PRIMARY KEY (gtfs_id, shape_id)
 );
+
 
 CREATE TABLE gtfs.stops (
-    stop_id               TEXT      PRIMARY KEY,
-    stop_name             TEXT,
-    location_type         SMALLINT,
-    parent_station        TEXT      DEFAULT '',
-    wheelchair_boarding   SMALLINT,
-    platform_code         TEXT,
+    gtfs_id TEXT NOT NULL,
 
-    -- Can this be upper case? What SRID this?
-    location              geometry(point, 4326)
-);
+    stop_id TEXT NOT NULL,
+    stop_code TEXT,
+    stop_name TEXT NOT NULL,
+    stop_desc TEXT,
+    stop_lat DOUBLE PRECISION NOT NULL,
+    stop_lon DOUBLE PRECISION NOT NULL,
+    zone_id TEXT,
+    stop_url TEXT,
+    location_type SMALLINT CHECK (location_type IN (0, 1)),
+    parent_station TEXT,
 
-CREATE TABLE gtfs.stop_times (
-    trip_id               TEXT,
-    arrival_time          TEXT,
-    departure_time        TEXT,
-    stop_id               TEXT,
-    stop_sequence         SMALLINT,
-    stop_headsign         TEXT,
-    pickup_type           SMALLINT,
-    drop_off_type         SMALLINT
+    PRIMARY KEY (gtfs_id, stop_id),
+
+    FOREIGN KEY (gtfs_id, parent_station)
+        REFERENCES gtfs.stops (gtfs_id, stop_id)
+        ON DELETE CASCADE,
+
+    UNIQUE (gtfs_id, stop_id)
 );
 
 CREATE TABLE gtfs.trips (
-    route_id              TEXT,
-    service_id            TEXT,
-    trip_id               TEXT,
+    gtfs_id               TEXT NOT NULL,
+
+    route_id              TEXT NOT NULL,
+    service_id            TEXT NOT NULL,
+    trip_id               TEXT NOT NULL,
     trip_headsign         TEXT,
     direction_id          SMALLINT,
     wheelchair_accessible SMALLINT,
     trip_bikes_allowed    SMALLINT,
-    shape_id              TEXT
+    block_id              TEXT,
+    shape_id              TEXT,
+
+    PRIMARY KEY (gtfs_id, trip_id),
+
+    FOREIGN KEY (gtfs_id, route_id)
+        REFERENCES gtfs.routes (gtfs_id, route_id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY (gtfs_id, shape_id)
+        REFERENCES gtfs.shapes (gtfs_id, shape_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE gtfs.calendar_dates (
+    gtfs_id        TEXT NOT NULL,
+
+    service_id     TEXT NOT NULL,
+    date           DATE NOT NULL,
+    exception_type SMALLINT NOT NULL CHECK (exception_type IN (1, 2)),
+
+    PRIMARY KEY (gtfs_id, service_id, date)
+);
+
+CREATE TABLE gtfs.stop_times (
+    gtfs_id TEXT NOT NULL,
+
+    trip_id TEXT NOT NULL,
+    arrival_time TEXT NOT NULL,
+    departure_time TEXT NOT NULL,
+    stop_id TEXT NOT NULL,
+    stop_sequence SMALLINT NOT NULL CHECK (stop_sequence >= 0),
+    stop_headsign TEXT,
+    pickup_type SMALLINT,
+    drop_off_type SMALLINT,
+    shape_dist_traveled NUMERIC CHECK (shape_dist_traveled >= 0),
+
+    PRIMARY KEY (gtfs_id, trip_id, stop_id, stop_sequence),
+
+    FOREIGN KEY (gtfs_id, trip_id)
+        REFERENCES gtfs.trips (gtfs_id, trip_id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY (gtfs_id, stop_id)
+        REFERENCES gtfs.stops (gtfs_id, stop_id)
+        ON DELETE CASCADE
 );
 
 
@@ -101,9 +192,6 @@ CREATE INDEX trips_trip_id              ON gtfs.trips(trip_id);
 
 CREATE INDEX stop_times_stop_id_trip_id ON gtfs.stop_times
         USING btree(trip_id, stop_id);
-
-CREATE INDEX stops_location             ON gtfs.stops
-        USING gist(location);
 
 
 -- -----------------------------------------------------------------------------
@@ -221,15 +309,15 @@ AS $$
                 AND stop_times.trip_id = trips.trip_id
                 AND routes.route_id = trips.route_id
                 AND (departs_within(
-                        stop_times.departure_time,
-                        '-5 minutes'::interval,
-                        n
+                    stop_times.departure_time,
+                    '-5 minutes'::interval,
+                    n
                 ))
                 OR (departs_within(
                     stop_times.departure_time,
                     '55 minutes'::interval,
-                    n)
-                )
+                    n
+                ))
                 AND trips.service_id = calendar_dates.service_id
                 AND calendar_dates.date = now()::date
                 AND calendar_dates.exception_type = 1
@@ -400,7 +488,7 @@ $$ LANGUAGE PLPGSQL;
 
 -- Return all routes that service a given stop_id
 
-CREATE OR REPLACE FUNCTION lines_for_stop(stop TEXT)
+CREATE OR REPLACE FUNCTION gtfs.lines_for_stop(stop TEXT)
     RETURNS TABLE(
         route_id text,
         name     text,
@@ -433,30 +521,6 @@ $$ LANGUAGE PLPGSQL;
 
 -- -----------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION stops_for_line(TEXT, INTEGER)
-    RETURNS TABLE(
-        name TEXT,
-        location TEXT,
-        stop_id TEXT,
-        stop_seq SMALLINT
-    )
-AS $$
-    SELECT
-        DISTINCT stops.stop_name,
-        st_asewkt(stops.location) AS location,
-        stops.stop_id,
-        stop_sequence
-    FROM gtfs.stop_times
-    LEFT JOIN gtfs.stops ON stops.stop_id = stop_times.stop_id
-    WHERE trip_id = (
-        SELECT longest_trip_for_route($1, $2)
-    )
-    ORDER BY stop_sequence;
-$$ LANGUAGE SQL;
-
-
--- -----------------------------------------------------------------------------
-
 CREATE OR REPLACE FUNCTION shape_for_line(line TEXT)
     RETURNS TABLE(geom geometry, seq INTEGER)
 AS $$
@@ -481,5 +545,29 @@ AS $$
             ORDER BY seq;
     END;
 $$ LANGUAGE PLPGSQL;
+
+
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION gtfs.stops_for_line(TEXT, INTEGER)
+    RETURNS TABLE(
+        name TEXT,
+        location TEXT,
+        stop_id TEXT,
+        stop_seq SMALLINT
+    )
+AS $$
+    SELECT DISTINCT
+        stops.stop_name,
+        ST_AsEWKT(ST_SetSRID(ST_Point(stop_lat, stop_lon), 4326)) AS location,
+        stops.stop_id,
+        stop_sequence
+    FROM gtfs.stop_times
+    LEFT JOIN gtfs.stops ON stops.stop_id = stop_times.stop_id
+    WHERE trip_id = (
+        SELECT longest_trip_for_route($1, $2)
+    )
+    ORDER BY stop_sequence;
+$$ LANGUAGE SQL;
 
 -- vi: filetype=pgsql

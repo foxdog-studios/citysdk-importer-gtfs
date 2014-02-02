@@ -1,673 +1,997 @@
 #!/usr/bin/env ruby
 
 require 'csv'
-require 'getoptlong'
+require 'fileutils'
 require 'json'
-require 'pg'
-require 'socket'
+require 'net/http'
+require 'pathname'
 require 'tempfile'
-require 'citysdk/importers/gtfs/util.rb'
 
-$quote = '"'
-
-$gtfs_files = [
-  'agency',
-  'calendar_dates',
-  'feed_info',
-  'routes',
-  'shapes',
-  'stop_times',
-  'stops',
-  'trips'
-]
-
-def create_schema(conn)
-  conn.exec('DROP SCHEMA IF EXISTS igtfs CASCADE;')
-  conn.exec('CREATE SCHEMA igtfs;')
-end
-
-def get_columns(data_dir, name)
-  path = File.join(data_dir, "#{name}.txt")
-  File.open(path) do |csv|
-    csv.gets.strip.split(',')
-  end
-end
-
-$c_types = {
-
-  'shapes' => {
-    'shape_id' => 'text',
-    'shape_pt_lat' => 'text',
-    'shape_pt_lon' => 'text',
-    'shape_pt_sequence' => 'integer'
-  },
-
-  'feed_info' => {
-    'feed_publisher_name' => 'text',
-    'feed_publisher_url' => 'text',
-    'feed_lang' => 'text',
-    'feed_start_date' => 'date',
-    'feed_end_date' => 'date',
-    'feed_valid_from' => 'date',
-    'feed_valid_to' => 'date',
-    'feed_version' => 'text'
-  },
-
-  'agency' => {
-    'agency_id' => 'text primary key',
-    'agency_name' => 'text',
-    'agency_url' => 'text',
-    'agency_timezone' => 'text',
-    'agency_lang' => 'text'
-  },
-
-  'calendar_dates' => {
-    'service_id' => 'text',
-    'date' => 'date',
-    'exception_type' => 'smallint'
-  },
-
-  'stops' => {
-    'stop_id' => 'text primary key',
-    'stop_name' => 'text',
-    'location_type' => 'smallint',
-    'parent_station' => 'text',
-    'wheelchair_boarding' => 'smallint',
-    'platform_code' => 'text',
-    'stop_lat' => 'float',
-    'stop_lon' => 'float'
-  },
-
-  'routes' => {
-    'route_id' => 'text primary key',
-    'agency_id' => 'text',
-    'route_short_name' => 'text',
-    'route_long_name' => 'text',
-    'route_type' => 'smallint'
-  },
-
-  'trips' => {
-    'route_id' => 'text',
-    'service_id' => 'text',
-    'trip_id' => 'text',
-    'trip_headsign' => 'text',
-    'shape_id' => 'text',
-    'direction_id' => 'smallint',
-    'wheelchair_accessible' => 'smallint',
-    'trip_bikes_allowed' => 'smallint'
-  },
-
-  'stop_times' => {
-    'trip_id' => 'text',
-    'arrival_time' => 'text',
-    'departure_time' => 'text',
-    'stop_id' => 'text',
-    'stop_sequence' => 'smallint',
-    'stop_headsign' => 'text',
-    'pickup_type' => 'smallint',
-    'drop_off_type' => 'smallint'
-  }
-}
+require 'docopt'
+require 'pg'
+require 'zip'
 
 
-def calendar_dates(conn, data_dir, prefix)
-  one_file(conn, data_dir, 'calendar_dates')
-  puts 'Merging calendar_dates...'
+DOC = <<-DOCOPT
+  Import a GTFS archive into a CitySDK instance.
 
-  conn.exec('DROP INDEX IF EXISTS calendar_dates_service_id;')
+  Usage:
+    import.rb cli [-H HOST | --host=HOST] GTFS_ID GTFS_DIR DATABASE USER
+                  PASSWORD
+    import.rb database CONFIG_PATH
 
-  conn.exec <<-SQL
-    INSERT INTO gtfs.calendar_dates
-    SELECT ('#{prefix}' || service_id), date, exception_type
-    FROM igtfs.calendar_dates;
-  SQL
+  Options:
+    -H HOST, --host=HOST The host on which the database is running
+                         [default: localhost].
 
-  conn.exec(
-    'CREATE TABLE calendar_dates AS SELECT DISTINCT * FROM gtfs.calendar_dates;'
-  )
-  conn.exec('DROP TABLE gtfs.calendar_dates;')
-  conn.exec('ALTER TABLE calendar_dates SET SCHEMA gtfs;')
-  conn.exec(
-    'CREATE INDEX calendar_dates_service_id ON gtfs.calendar_dates(service_id);'
-  )
-end
+DOCOPT
 
 
-def stops(conn, data_dir, prefix)
-  columns = one_file(conn, data_dir, 'stops')
+def main(argv = ARGV)
+  args = Docopt::docopt(DOC, argv: argv)
 
-  puts 'Merging stops...'
+  if args.fetch('database')
+    database_main(args, 'gtfs')
+  else
+    cli_main(args)
+  end # if
 
-  select = "i.stop_name"
-  select += columns.include?('location_type') ? ",i.location_type" : ", 0"
-  select += columns.include?('parent_station') ? ",i.parent_station" : ", ''"
-  select += columns.include?('platform_code') ? ", i.platform_code" : ", ''"
-  select += ",i.location"
-  select += columns.include?('wheelchair_boarding') ? ", i.wheelchair_boarding" : ", 0"
+  0
+end # def
 
-  select2 = "stop_id,stop_name,location_type,parent_station, wheelchair_boarding, platform_code,location"
-  select2.gsub!('location_type',"0") if !columns.include?('location_type')
-  select2.gsub!('parent_station',"''") if !columns.include?('parent_station')
-  select2.gsub!('wheelchair_boarding',"0") if !columns.include?('wheelchair_boarding')
-  select2.gsub!('platform_code',"''") if !columns.include?('platform_code')
 
-  conn.exec('ALTER TABLE igtfs.stops ADD COLUMN location geometry(point,4326)')
-  conn.exec(
-    "UPDATE igtfs.stops SET (stop_id, location) = ('#{prefix}' || stop_id, " \
-    'ST_SetSRID(ST_Point(stop_lon,stop_lat),4326))'
+def database_main(args, gtfs_layer)
+  config_path = args.fetch('CONFIG_PATH')
+  config = File.open(config_path) do |config_file|
+    JSON.load(config_file)
+  end # do
+
+  conn = PG::Connection.new(
+    host:     config.fetch('db_host'),
+    dbname:   config.fetch('db_name'),
+    user:     config.fetch('db_user'),
+    password: config.fetch('db_pass')
   )
 
-  if columns.include?('parent_station')
-    conn.exec(
-      "UPDATE igtfs.stops SET parent_station = '' WHERE parent_station IS NULL"
+  conn.exec('SELECT * FROM gtfs.feed;').each do |feed|
+    uri = URI.parse(feed.fetch('uri'))
+    gtfs_id = feed.fetch('gtfs_id')
+    last_imported = feed.fetch('last_imported')
+    last_imported = Date.parse(last_imported)  unless last_imported.nil?
+    download_and_import_gtfs_if_newer(
+      conn,
+      uri,
+      gtfs_id,
+      gtfs_layer,
+      last_imported
     )
-  end
-
-  if columns.include?('wheelchair_boarding')
-    conn.exec(
-      'UPDATE igtfs.stops SET wheelchair_boarding = 0 ' \
-      'WHERE wheelchair_boarding IS NULL'
-    )
-  end
-
-  if columns.include?('platform_code')
-    conn.exec(
-      "UPDATE igtfs.stops SET platform_code = '' WHERE platform_code IS NULL"
-    )
-  end
-
-  if columns.include?('location_type')
-    conn.exec(
-      'UPDATE igtfs.stops SET location_type = 0 WHERE location_type IS NULL'
-    )
-  end
-
-  conn.exec <<-SQL
-    WITH upsert AS (
-      UPDATE gtfs.stops g SET (
-        stop_name,
-        location_type,
-        parent_station,
-        platform_code,
-        location,
-        wheelchair_boarding
-      ) = (#{select})
-      FROM igtfs.stops i WHERE g.stop_id = i.stop_id
-      RETURNING g.stop_id
-    )
-    INSERT INTO gtfs.stops
-      SELECT #{select2}
-      FROM igtfs.stops a
-      WHERE a.stop_id NOT IN (SELECT stop_id FROM upsert);
-  SQL
+  end # do
 end
 
-def agency(conn, data_dir)
-  columns = one_file(conn, data_dir, 'agency')
-  return unless columns
-  puts "Merging agency.."
 
-  select  = "agency_id,agency_name,agency_url,agency_timezone,agency_lang"
-  iselect = "i.agency_name,i.agency_url,i.agency_timezone,i.agency_lang"
+def download_and_import_gtfs_if_newer(
+  conn,
+  uri,
+  gtfs_id,
+  gtfs_layer,
+  last_imported
+)
+  puts 'Checking when the GTFS archive was modified...'
+  last_modified = get_last_modified(uri)
+  puts "The GTFS archive was modified at #{ last_modified }."
 
-  if !columns.include?('agency_lang')
-    select.gsub!('agency_lang', "''")
-    iselect.gsub!('i.agency_lang', "''")
-  end
-
-  conn.exec <<-SQL
-    WITH upsert AS (
-      UPDATE gtfs.agency g SET (
-        agency_name,
-        agency_url,
-        agency_timezone,
-        agency_lang
-      ) = (#{iselect})
-      FROM igtfs.agency i WHERE g.agency_id = i.agency_id
-      RETURNING g.agency_id
+  if last_imported.nil? || last_modified > last_imported
+    puts "The GTFS has been modified since #{ last_imported }."
+    archive_path = download_and_import_gtfs(
+      conn,
+      uri,
+      gtfs_id,
+      gtfs_layer,
+      last_modified
     )
-    INSERT INTO gtfs.agency
-    SELECT #{select}
-    FROM igtfs.agency a
-    WHERE a.agency_id NOT IN (
-      SELECT agency_id FROM upsert
-    );
-  SQL
-end
+  else
+    puts "The GTFS has not been modified since #{ last_imported }."
+  end # if
+end # def
 
-def shapes(conn, data_dir)
-  unless File.file?(File.join(data_dir, 'shapes.txt'))
-    return
-  end
 
-  puts 'Merging shapes...'
-  columns = one_file(conn, data_dir, 'shapes')
+def get_last_modified(uri)
+  use_ssl = uri.scheme == 'https'
+  http = Net::HTTP.start(uri.host, uri.port, use_ssl: use_ssl)
+  response = http.head(uri.request_uri)
+  last_modified = response.fetch('Last-Modified')
+  last_modified = last_modified[/.*,\s+(.*)\s+\d\d:/, 1]
+  Date.parse(last_modified)
+end # def
 
-  conn.exec <<-SQL
-    DELETE FROM gtfs.shapes g
-      WHERE g.shape_id IN (
-        SELECT DISTINCT shape_id FROM igtfs.shapes
-      );
 
-    INSERT INTO gtfs.shapes
-      SELECT shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence
-      FROM igtfs.shapes;
-  SQL
-end
-
-def feed_info(conn, data_dir)
-  unless File.file?(File.join(data_dir, 'feed_info'))
-    return
-  end
-
-  columns = one_file(conn, data_dir, 'feed_info')
-  return unless columns
-
-  a = []
-  CSV.foreach(
-    File.join(data_dir, 'agency.txt'),
-    :quote_char => '"',
-    :col_sep =>',',
-    :headers => true,
-    :row_sep =>:auto
-  ) do |row|
-    a << row['agency_name']
-  end
-  a = conn.escape(a.join(', '))
-
-  select = [
-    'feed_publisher_name',
-    'feed_publisher_url',
-    'feed_lang',
-    'feed_start_date',
-    'feed_end_date',
-    'feed_version',
-    a,
-    Time.now.strftime('%Y-%m-%d')
-  ].join(',')
-
-  if columns.include?('feed_valid_to')
-    select.gsub!('feed_end_date', 'feed_valid_to')
-  end
-
-  if columns.include?('feed_valid_from')
-    select.gsub!('feed_start_date', 'feed_valid_from')
-  end
-
-  conn.exec <<-SQL
-    DELETE FROM gtfs.feed_info g USING igtfs.feed_info i
-      WHERE g.feed_version = i.feed_version;
-    INSERT INTO gtfs.feed_info select #{select} FROM igtfs.feed_info;
-  SQL
-end
-
-def routes(conn, data_dir, prefix)
-  columns = one_file(conn, data_dir, 'routes')
-  puts "Merging routes.."
-
-  select  = "route_id,agency_id,route_short_name,route_long_name,route_type"
-  iselect = "i.agency_id,i.route_short_name,i.route_long_name,i.route_type"
-  unless columns.include?('agency_id')
-    select.gsub!('agency_id', "''")
-    iselect.gsub!('i.agency_id', "''")
-  end
-
-  conn.exec("UPDATE igtfs.routes SET (route_id) = ('#{prefix}' || route_id)")
-
-  conn.exec <<-SQL
-    UPDATE igtfs.routes
-    SET route_short_name = route_long_name
-    WHERE route_short_name is NULL
+def download_and_import_gtfs(conn, uri, gtfs_id, gtfs_layer, last_modified)
+  sql = <<-SQL
+    UPDATE gtfs.feed
+      SET last_imported = $1::timestamptz
+      WHERE gtfs_id = $2::text
+    ;
   SQL
 
-  conn.exec <<-SQL
-    WITH upsert as
-    (update gtfs.routes g set
-      (agency_id,route_short_name,route_long_name,route_type) =
-      (#{iselect})
-      from igtfs.routes i where g.route_id=i.route_id
-        returning g.route_id
-    )
-    insert into gtfs.routes select
-      #{select}
-    from igtfs.routes a where a.route_id not in (select route_id from upsert);
-  SQL
-end
+  Tempfile.create([gtfs_id, '.zip']) do |archive|
+    archive.binmode
+    download_gtfs(uri, archive)
+    archive.seek(0)
+    Dir.mktmpdir do |gtfs_dir|
+      gtfs_dir = Pathname.new(gtfs_dir)
+      extract_gtfs(archive, gtfs_dir)
+      conn.transaction do
+        import_gtfs_and_upsert_nodes(conn, gtfs_id, gtfs_dir, gtfs_layer)
+        conn.exec_params(sql, [last_modified, gtfs_id])
+      end # do
+    end # do
+  end # do
+end # def
 
-def stop_times(conn, data_dir, prefix)
-  columns = one_file(conn, data_dir, 'stop_times')
 
-  conn.exec('DROP INDEX IF EXISTS gtfs.stop_times_trip_id;')
-  conn.exec('DROP INDEX IF EXISTS gtfs.stop_times_stop_id;')
-  conn.exec('DROP INDEX IF EXISTS gtfs.stop_times_departure_time;')
-  conn.exec('DROP INDEX IF EXISTS gtfs.stop_times_stop_id_trip_id;')
+def download_gtfs(uri, archive)
+  puts 'Downloading GTFS archive...'
 
-  select = (
-    "'#{prefix}' || trip_id, arrival_time, departure_time, "
-    "'#{prefix}' || stop_id, stop_sequence, stop_headsign, "
-    "pickup_type, drop_off_type"
+  use_ssl = uri.scheme == 'https'
+  Net::HTTP.start(uri.host, uri.port, use_ssl: use_ssl) do |http|
+    request = Net::HTTP::Get.new(uri)
+    http.request(request) do |response|
+      response.read_body { |chunk| archive.write(chunk) }
+    end # do
+  end # do
+
+  puts 'Dowloaded GTFS archive.'
+end # def
+
+
+def extract_gtfs(src, dst)
+  Zip::File.open(src) do |zip_file|
+    zip_file.each do |f|
+      path = dst.join(File.basename(f.name))
+      zip_file.extract(f, path)
+    end # do
+  end # do
+end # def
+
+
+def cli_main(args)
+  gtfs_dir = Pathname.new(args.fetch('GTFS_DIR'))
+  expand_ranges_and_apply_exceptions(gtfs_dir)
+
+  conn = PG::Connection.new(
+    host:     args.fetch('--host'),
+    dbname:   args.fetch('DATABASE'),
+    user:     args.fetch('USER'),
+    password: args.fetch('PASSWORD')
   )
 
-  select.gsub!('stop_headsign', "''") unless columns.include?('stop_headsign')
-  select.gsub!('pickup_type', '0') unless columns.include?('pickup_type')
-  select.gsub!('drop_off_type', '0') unless columns.include?('drop_off_type')
-
-  puts 'Merging stop_times...'
-  conn.exec(
-    "INSERT INTO gtfs.stop_times SELECT #{select} FROM igtfs.stop_times;"
-  )
-
-  conn.exec(
-    'CREATE TABLE stop_times AS SELECT DISTINCT * FROM gtfs.stop_times;'
-  )
-  conn.exec('DROP TABLE gtfs.stop_times;')
-  conn.exec('ALTER TABLE stop_times SET SCHEMA gtfs;')
-
-  puts 'Creating index on stop_times(stop_id,trip_id)...'
-  conn.exec <<-SQL
-    CREATE INDEX stop_times_stop_id_trip_id
-    ON gtfs.stop_times
-    USING btree(trip_id, stop_id);
-  SQL
-
-  puts 'Creating index on stop_times(trip_id)...'
-  conn.exec('CREATE INDEX stop_times_trip_id ON gtfs.stop_times(trip_id);')
-
-  puts 'Creating index on stop_times(stop_id)...'
-  conn.exec('CREATE INDEX stop_times_stop_id ON gtfs.stop_times(stop_id);')
-
-  puts 'Creating index on stop_times(departure_time)...'
-  conn.exec(
-    'CREATE INDEX stop_times_departure_time ON gtfs.stop_times(departure_time);'
-  )
-end
-
-def trips(conn, data_dir, prefix)
-  columns = one_file(conn, data_dir, 'trips')
-  return unless columns
-
-  puts "Merging trips.."
-
-  select = "'#{prefix}' || route_id, '#{prefix}' || service_id, '#{prefix}' || trip_id"
-  select += columns.include?('trip_headsign') ? ", trip_headsign" : ", ''"
-  select += columns.include?('direction_id') ? ", direction_id" : ", 0"
-  select += columns.include?('wheelchair_accessible') ? ", wheelchair_accessible" : ", 0"
-  select += columns.include?('trip_bikes_allowed') ? ", trip_bikes_allowed" : ", 0"
-  select += columns.include?('shape_id') ? ", '#{prefix}' || shape_id" : ", ''"
-
-  if columns.include?('direction_id')
-    conn.exec(
-      'UPDATE igtfs.trips SET direction_id = 0 WHERE direction_id is NULL'
+  conn.transaction do
+    import_gtfs_and_upsert_nodes(
+      conn,
+      args.fetch('GTFS_ID'),
+      gtfs_dir,
+      'gtfs'
     )
-  end
+  end # do
+ensure
+  conn.close if defined? conn
+end # def
 
-  conn.exec("INSERT INTO gtfs.trips SELECT #{select} FROM igtfs.trips;")
-  conn.exec('CREATE TABLE trips as SELECT DISTINCT * FROM gtfs.trips;')
-  conn.exec('DROP TABLE gtfs.trips;')
-  conn.exec('ALTER TABLE trips SET SCHEMA gtfs;')
-  conn.exec('CREATE INDEX trips_trip_id ON gtfs.trips(trip_id);')
-  conn.exec('CREATE INDEX trips_route_id ON gtfs.trips(route_id);')
-  conn.exec('CREATE INDEX trips_direction_id ON gtfs.trips(direction_id);')
+
+def import_gtfs_and_upsert_nodes(conn, gtfs_id, gtfs_dir, gtfs_layer)
+  conn.exec('SET search_path TO gtfs;')
+  import_gtfs(conn, gtfs_id, gtfs_dir)
+  conn.exec('SET search_path TO public;')
+  upsert_nodes(conn, gtfs_id, gtfs_layer)
 end
 
-def one_file(conn, data_dir, name)
-  puts "Copying #{name} from disk..."
 
-  columns = get_columns(data_dir, name)
-  return unless columns
+# ==============================================================================
+# = Preprocess calendar                                                        =
+# ==============================================================================
 
-  ca = columns.map do |column|
-    column_type = $c_types[name][column] || 'text'
-    "#{column} #{column_type}"
+EXCEPTION_TYPE_ADDED = '1'
+EXCEPTION_TYPE_REMOVED = '2'
+
+
+def expand_ranges_and_apply_exceptions(gtfs_dir)
+  calendar = gtfs_dir.join('calendar.txt')
+  calendar_dates_src = gtfs_dir.join('calendar_dates.txt')
+  calendar_dates_dst = gtfs_dir.join('calendar_dates.preprocessed.txt')
+
+  # If the preoprocessed version exists, we don't need to do anything.
+  return if calendar_dates_dst.exist?
+
+  exceptions = {}
+
+  CSV.foreach(calendar_dates_src, :headers => true) do |row|
+    service_id = row.fetch('service_id')
+    date = Date.parse(row.fetch('date'))
+    exception_type = row.fetch('exception_type')
+    ((exceptions[service_id] ||= {})[service_id] ||= {})[date] = exception_type
   end
 
-  ca = ca.join(',')
-  conn.exec("CREATE table igtfs.#{name} (#{ca})")
-  conn.exec("COPY igtfs.#{name} FROM stdin QUOTE '#{$quote}' CSV HEADER")
+  CSV.open(calendar_dates_dst, 'w') do |csv|
+    csv << ['service_id', 'date', 'exception_type']
 
-  path = File.join(data_dir, "#{name}.txt")
-  File.open(path, 'r').each_line do |line|
-     fail unless conn.put_copy_data line
-  end
+    CSV.foreach(calendar, :headers => true) do |row|
+      days = [
+        row.fetch('sunday'),
+        row.fetch('monday'),
+        row.fetch('tuesday'),
+        row.fetch('wednesday'),
+        row.fetch('thursday'),
+        row.fetch('friday'),
+        row.fetch('saturday')
+      ]
 
-  fail unless conn.put_copy_end
-  columns
-end
-
-def copy_tables(conn, data_dir, prefix)
-  create_schema(conn)
-  feed_info(conn, data_dir)
-  agency(conn, data_dir)
-  calendar_dates(conn, data_dir, prefix)
-  routes(conn, data_dir, prefix)
-  trips(conn, data_dir, prefix)
-  stops(conn, data_dir, prefix)
-  stop_times(conn, data_dir, prefix)
-  shapes(conn, data_dir)
-end
-
-def do_stops(conn, layer_id, data_dir, prefix)
-  puts 'Mapping stops..'
-
-  stops_a = []
-
-  CSV.open(
-    File.join(data_dir, 'stops.txt'),
-    'r:bom|utf-8',
-    :quote_char => '"',
-    :col_sep =>',',
-    :headers => true,
-    :row_sep => :auto
-  ) do |csv|
-    csv.each do |row|
-      s = prefix + row['stop_id']
-      stops_a << "'#{s}'"
+      expand_calendar_row(
+        exceptions,
+        row.fetch('service_id'),
+        days,
+        Date.parse(row.fetch('start_date')),
+        Date.parse(row.fetch('end_date')),
+        csv
+      )
     end
   end
+end
 
-  stops_a_csv = stops_a.join(',')
-  stops = conn.exec(
-    "SELECT * FROM gtfs.stops WHERE stop_id IN (#{stops_a_csv}) " \
-    'ORDER BY stop_name'
-  );
-  stopsCount = stops.cmdtuples
 
-  stops.each do |stop|
-    nid = GTFS_Import::stopNode(conn, layer_id, stop)
-    GTFS_Import::stopNodeData(conn, layer_id, nid, stop) if nid
-    if stopsCount % 100 == 0
-      puts "#{stopsCount}; #{stop['stop_name']}"
+def expand_calendar_row(exceptions, service_id, days, start_date, end_date, csv)
+  date = start_date
+  end_date = end_date.next
+
+  while date < end_date do
+    has = lambda do |exception_type|
+      service_has_exception(exceptions, service_id, date, exception_type)
     end
-    stopsCount -= 1
+
+    runs = false
+
+    # If normally runs, check if it exceptionally doesn't.
+    if days[date.wday] == '1'
+      unless has.call(EXCEPTION_TYPE_REMOVED)
+        runs = true
+      end
+    elsif has.call(EXCEPTION_TYPE_ADDED)
+      # Normally does not run, but this is an exception.
+      runs = true
+    end
+
+    if runs
+      csv << [service_id, date.strftime('%Y%m%d'), 1]
+    end
+
+    date = date.next
   end
 end
 
-def do_routes(conn, layer_id, data_dir, prefix)
-  puts 'Mapping routes...'
 
-  @val=nil
-
-  path = File.join(data_dir, 'feed_info.txt')
-  if File.file?(path)
-    File.open(path) do |f|
-      headers = f.gets.chomp.split(',')
-      sd = headers.index('feed_start_date') || headers.index('feed_valid_from')
-      ed = headers.index('feed_end_date') || headers.index('feed_valid_to')
-      if sd && ed
-        s = f.gets.chomp.split(',')
-        sd = s[sd] + " 00:00"
-        ed = s[ed] + " 23:59"
-        @val = "[#{sd},#{ed}]"
+def service_has_exception(exceptions, service_id, date, exception_type)
+  if exceptions.key?(service_id)
+    service_exceptions = exceptions[service_id]
+    if service_exceptions.key?(date)
+      if service_exceptions[date] == exception_type
+        return true
       end
     end
   end
+  false
+end
 
-  $routes_rejected = 0
 
-  route_a = CSV.open(
-    File.join(data_dir, 'routes.txt'),
-    'r:bom|utf-8',
-    :quote_char => '"',
-    :col_sep =>',',
-    :headers => true,
-    :row_sep =>:auto
-  ) do |csv|
-    csv.map do |row|
-      "'#{prefix}#{row['route_id']}'"
+# ==============================================================================
+# = Import                                                                     =
+# ==============================================================================
+
+def import_gtfs(conn, gtfs_id, gtfs_dir)
+  importer = GTFSImporter.new(conn, gtfs_id, gtfs_dir)
+  importer.import_all
+end
+
+
+class GTFSImporter
+  def initialize(conn, gtfs_id, gtfs_dir)
+    @conn = conn
+    @gtfs_id = gtfs_id
+    @gtfs_dir = gtfs_dir
+  end
+
+  def import_all
+    import_agency
+    import_routes
+    import_stops
+    import_trips
+    import_stop_times
+    import_feed_info
+    import_calendar_dates
+    import_shapes
+  end
+
+  def import_agency
+    import('agency')
+  end
+
+  def import_calendar_dates
+    import('calendar_dates')
+  end
+
+  def import_feed_info
+    import('feed_info', optional = true)
+  end
+
+  def import_routes
+    import('routes')
+  end
+
+  def import_shapes
+    import('shapes', optional = true)
+  end
+
+  def import_stops
+    import('stops')
+  end
+
+  def import_stop_times
+    import('stop_times')
+  end
+
+  def import_trips
+    import('trips')
+  end
+
+  private
+
+  def import(name, optional = false)
+    path = @gtfs_dir.join("#{ name }.txt")
+    unless optional && !File.exists?(path)
+      Importer.new(@conn, @gtfs_id, path).import
+    end
+  end
+end
+
+
+class Importer
+  def initialize(conn, gtfs_id, path)
+    @conn = conn
+    @gtfs_id = gtfs_id
+    @path = path
+
+    base_name = path.basename(path.extname).to_s
+    @table_name = base_name
+    @tmp_table_name = 'tmp_' + base_name
+    @tmp_columns = CSV.open(@path) { |csv| csv.shift }
+  end
+
+  def import
+    puts "Importing #{ @table_name }..."
+
+    create_tmp_table
+    copies = copy_csv.cmd_tuples
+    lock_table
+    deletes = delete_rows.cmd_tuples
+    inserts = insert_rows.cmd_tuples
+
+    puts "Imported #{@table_name} (#{copies} copies, #{deletes} deletes, " \
+         "#{inserts} inserts)"
+  end
+
+  private
+
+  def create_tmp_table
+    columns = make_columns
+    @conn.exec <<-SQL
+      CREATE TEMPORARY TABLE #{ @tmp_table_name }
+        ON COMMIT DROP
+        AS (
+          SELECT #{ columns } FROM #{ @table_name }
+        )
+        WITH NO DATA
+      ;
+    SQL
+  end
+
+  def copy_csv
+    columns = make_columns
+    sql = "COPY #{ @tmp_table_name } (#{ columns }) FROM STDOUT CSV HEADER;"
+    @conn.copy_data(sql) do
+      IO.foreach(@path) { |line| @conn.put_copy_data(line) }
     end
   end
 
-  route_a_csv = route_a.join(',')
-  routes = conn.exec(
-    "SELECT * FROM gtfs.routes WHERE route_id IN (#{route_a_csv})"
-  )
+  def lock_table
+    @conn.exec("LOCK TABLE #{ @table_name } IN EXCLUSIVE MODE;")
+  end
 
-  num_routes_to_add = routes.cmdtuples
+  def delete_rows
+    sql = "DELETE FROM #{ @table_name } WHERE gtfs_id = $1::text;"
+    @conn.exec_params(sql, [@gtfs_id]);
+  end
 
-  routes.each do |route|
+  def insert_rows
+    dst_columns = make_columns
+    src_columns = make_columns(table = @tmp_table_name)
+    sql = <<-SQL
+      INSERT INTO #{ @table_name } (gtfs_id, #{ dst_columns })
+        SELECT $1::text, #{ src_columns }
+        FROM #{ @tmp_table_name }
+      ;
+    SQL
+    @conn.exec(sql, [@gtfs_id])
+  end
+
+  def make_columns(table = nil)
+    columns = @tmp_columns.dup
+    unless table.nil?
+      columns.map! do |column|
+        "#{ table }.#{ column }"
+      end
+    end
+    columns.join(', ')
+  end
+end
+
+
+# ==============================================================================
+# = Nodes                                                                      =
+# ==============================================================================
+
+def upsert_nodes(conn, gtfs_id, layer_name)
+  layer_id = find_layer_id_from_name(conn, layer_name)
+  upsert_stop_nodes_and_stop_node_data(conn, gtfs_id, layer_id)
+  upsert_route_nodes(conn, gtfs_id, layer_id)
+end
+
+
+def find_layer_id_from_name(conn, layer_name)
+  sql = 'SELECT id FROM layers WHERE name = $1::text;'
+  conn.exec_params(sql, [layer_name])[0].fetch('id')
+end
+
+
+# = Stop nodes =================================================================
+
+def upsert_stop_nodes_and_stop_node_data(conn, gtfs_id, layer_id)
+  puts 'Upserting stop nodes and stop data nodes...'
+
+  sql = 'SELECT * FROM gtfs.stops WHERE gtfs_id = $1::text;'
+  conn.exec_params(sql, [gtfs_id]).each do |stop|
+    node_id = upsert_stop_node(conn, stop, layer_id)
+    upsert_stop_node_data(conn, stop, layer_id, node_id)
+  end
+
+  puts 'Upserted stop nodes and stop data nodes'
+end
+
+
+def upsert_stop_node(conn, stop, layer_id)
+  cdkid_suffix = stop.fetch('stop_id').downcase.gsub(/\W/, '.')
+  cdkid = 'gtfs.stop.' + cdkid_suffix
+
+  sql = 'SELECT id FROM nodes WHERE cdk_id = $1::text;'
+  result = conn.exec_params(sql, [cdkid])
+
+  if result.cmd_tuples.zero?
+    node_id = insert_stop_node(conn, stop, layer_id, cdkid)
+  else
+    node_id = result[0].fetch('id')
+    update_stop_node(conn, stop, node_id)
+  end
+
+  node_id
+end
+
+
+def insert_stop_node(conn, stop, layer_id, cdkid)
+  node_id = get_next_value(conn, 'nodes1_id_seq')
+
+  sql = <<-SQL
+    INSERT
+      INTO nodes (
+        id,
+        cdk_id,
+        layer_id,
+        node_type,
+        name,
+        geom
+      )
+      VALUES (
+        $1::integer, -- id
+        $2::text,    -- cdk_id
+        $3::integer, -- layer_id
+        2,           -- node_type
+        $4::text,    -- name
+        ST_SetSRID(  -- geom
+          ST_Point(
+            $5::double precision,
+            $6::double precision
+          ),
+          4326
+        )
+      )
+    ;
+  SQL
+
+  conn.exec_params(sql, [
+    node_id,
+    cdkid,
+    layer_id,
+    stop.fetch('stop_name'),
+    stop.fetch('stop_lat'),
+    stop.fetch('stop_lon')
+  ])
+
+  node_id
+end
+
+
+def update_stop_node(conn, stop, node_id)
+  sql = <<-SQL
+    UPDATE nodes
+      SET
+        name = $1::text,
+        geom = ST_SetSRID(
+          ST_Point(
+            $2::double precision,
+            $3::double precision
+          ),
+          4326
+        )
+      WHERE id = $4::integer
+    ;
+  SQL
+
+  conn.exec_params(sql, [
+    stop.fetch('stop_name'),
+    stop.fetch('stop_lat'),
+    stop.fetch('stop_lon'),
+    node_id
+  ])
+end
+
+
+# = Stop node data =============================================================
+
+def upsert_stop_node_data(conn, stop, layer_id, node_id)
+  sql = <<-SQL
+    SELECT id
+      FROM node_data
+      WHERE
+        layer_id = $1::integer
+        AND node_id = $2::integer
+    ;
+  SQL
+
+  result = conn.exec_params(sql, [layer_id, node_id])
+  data = hash_to_hstore(conn, stop)
+  modalities = get_modalities_for_stop(conn, stop)
+
+  if result.cmd_tuples.zero?
+    node_data_id = insert_stop_node_data(conn, stop, layer_id, node_id)
+  else
+    node_data_id = result[0].fetch('id')
+    update_stop_node_data(conn, stop, node_data_id)
+  end
+
+  node_data_id
+end
+
+
+def insert_stop_node_data(conn, stop, layer_id, node_id)
+  sql = <<-SQL
+    INSERT
+      INTO node_data (
+        id,
+        layer_id,
+        node_id,
+        data,
+        modalities
+      )
+      VALUES (
+        $1::integer,  -- id
+        $2::integer,  -- layer_id
+        $3::integer,  -- node_id
+        $4::hstore,   -- data
+        $5::integer[] -- modalities
+      )
+    ;
+  SQL
+  node_data_id = get_next_value(conn, 'node_data_id_seq')
+  conn.exec_params(sql, [
+    node_data_id,
+    layer_id,
+    node_id,
+    hash_to_hstore(conn, stop),
+    get_modalities_for_stop(conn, stop)
+  ])
+  node_data_id
+end
+
+
+def update_stop_node_data(conn, stop, node_data_id)
+  sql = <<-SQL
+    UPDATE node_data
+      SET
+        data = $1::hstore,
+        modalities = $2::integer[]
+      WHERE id = $3::integer
+    ;
+  SQL
+  conn.exec_params(sql, [
+    hash_to_hstore(conn, stop),
+    get_modalities_for_stop(conn, stop),
+    node_data_id
+  ])
+end
+
+
+# = Route nodes ================================================================
+
+def upsert_route_nodes(conn, gtfs_id, layer_id)
+  puts 'Upserting route nodes...'
+
+  sql = <<-SQL
+    SELECT feed_valid_from, feed_valid_to
+    FROM gtfs.feed_info
+    WHERE gtfs_id = $1::text;
+  SQL
+
+  result = conn.exec_params(sql, [gtfs_id])
+  validity = nil
+
+  if result.cmd_tuples > 0
+    tuple = result[0]
+    start_date = tuple.fetch('feed_start_date')
+    end_date = tuple.fetch('feed_end_date')
+    validity = "[#{ start_date } 00:00, #{ end_date } 23:59]"
+  end
+
+  result.clear
+
+  sql = <<-SQL
+    SELECT *
+      FROM gtfs.routes
+      WHERE gtfs_id = $1::text
+    ;
+  SQL
+
+  result = conn.exec_params(sql, [gtfs_id])
+  num_routes_to_add = result.cmdtuples
+
+  result.each do |route|
     puts [
       num_routes_to_add,
-      route['route_id'],
-      route['route_short_name'],
-      route['route_long_name']
+      route.fetch('route_id'),
+      route.fetch('route_short_name'),
+      route.fetch('route_long_name')
     ].join('; ')
 
+    upsert_route(conn, gtfs_id, layer_id, route, 0, validity)
+    upsert_route(conn, gtfs_id, layer_id, route, 1, validity)
+
     num_routes_to_add -= 1
-    GTFS_Import::addOneRoute(conn, layer_id, route, 0, @val, prefix)
-    GTFS_Import::addOneRoute(conn, layer_id, route, 1, @val, prefix)
+  end # do
+end
+
+
+def upsert_route(conn, gtfs_id, layer_id, route, direction, validity)
+  sql = 'SELECT * FROM gtfs.stops_for_line($1::text, $2::integer);'
+  route_id = route.fetch('route_id')
+  stops = conn.exec_params(sql, [route_id, direction])
+
+  return if stops.cmd_tuples == 0
+
+  members = []
+  line = []
+  start_name = end_name = nil
+
+  sql = 'SELECT * FROM shape_for_line($1::text);'
+  shape = conn.exec(sql, [route_id])
+  found_shape = shape.cmd_tuples >= 0
+
+  stops.each do |stop|
+    stop_id = stop.fetch('stop_id')
+    next if stop_id.nil? || stop_id == ''
+
+    sql = <<-SQL
+      SELECT *
+        FROM node_data
+        WHERE
+          layer_id = $1::int
+          AND (data @> $2::hstore)
+      ;
+    SQL
+
+    result = conn.exec_params(sql, [
+      layer_id,
+      hash_to_hstore(conn,
+        'gtfs_id' => gtfs_id,
+        'stop_id' => stop_id
+      )
+    ])
+
+    if result.cmd_tuples > 0
+      result.each do |node_data|
+        start_name = stop.fetch('name')
+        end_name = stop.fetch('name')
+        node_data_str = node_data.fetch('node_id')
+        members << node_data_str
+
+        if found_shape
+          sql = 'SELECT geom FROM nodes WHERE id = $1::integer;'
+          result = conn.exec_params(sql, [node_data_str])
+          geom = result[0].fetch('geom')
+          line << "'#{ geom }'::geometry"
+        end # if
+
+      end # do
+    end # if
+  end # do
+
+  if members.length > 0
+    if found_shape
+      shape.each do |shape|
+        geom = shape.fetch('geom')
+        line << "'#{ geom }'"
+      end # do
+    end # if
+
+    route['route_from'] = start_name
+    route['route_to'] = end_name
+
+    node_id = upsert_route_node(
+      conn,
+      route,
+      members,
+      line,
+      direction,
+      gtfs_id,
+      layer_id
+    )
+
+    upsert_route_node_data(conn, route, layer_id, node_id, validity)
+  end # if
+end
+
+
+def upsert_route_node(conn, route, members, line, direction, gtfs_id, layer_id)
+  sql = 'SELECT id FROM nodes WHERE cdk_id = $1::text;'
+
+  short_name = route.fetch('route_short_name')
+
+  cdk_id = [
+    'gtfs',
+    'line',
+    gtfs_id.gsub(/\W/, ''),
+    "#{ short_name.gsub(/\W/, '') }-#{ direction }".downcase
+  ].join('.')
+
+  result = conn.exec_params(sql, [cdk_id])
+
+  name = [
+    gtfs_id,
+    get_modality_name_for_route(route),
+    short_name
+  ].join(' ')
+
+  members = "{#{ members.join(',') }}"
+
+  line = "ST_MakeLine(ARRAY[#{ line.join(',') }])"
+
+  if result.cmd_tuples == 0
+    route_node_id = insert_route_node(
+      conn,
+      layer_id,
+      cdk_id,
+      name,
+      members,
+      line
+    )
+  else
+    route_node_id = result[0].fetch('id')
+    update_route_node(conn, route_node_id, name, members, line)
+  end
+
+  route_node_id
+end
+
+
+def insert_route_node(conn, layer_id, cdk_id, name, members, line)
+  sql = <<-SQL
+    INSERT
+      INTO nodes (
+        id,
+        name,
+        cdk_id,
+        layer_id,
+        node_type,
+        members,
+        geom
+      )
+      VALUES (
+        $1::integer,  -- id
+        $2::text,     -- name
+        $3::text,     -- cdk_id
+        $4::integer,  -- layer_id
+        3,            -- node_type
+        $5::bigint[], -- members
+        #{ line }     -- geom
+      )
+    ;
+  SQL
+
+  route_node_id = get_next_value(conn, 'nodes1_id_seq')
+  conn.exec_params(sql, [
+    route_node_id,
+    name,
+    cdk_id,
+    layer_id,
+    members,
+  ])
+  route_node_id
+end
+
+
+def update_route_node(conn, route_node_id, name, members, line)
+  sql = <<-SQL
+    UPDATE nodes
+      SET
+        name = $1::text,
+        geom = #{ line },
+        members = $2::bigint[]
+      WHERE id = $3::integer
+    ;
+  SQL
+  conn.exec_params(sql, [name, members, route_node_id])
+end
+
+
+def upsert_route_node_data(conn, route, layer_id, node_id, validity)
+  sql = <<-SQL
+    SELECT id
+      FROM node_data
+      WHERE
+        layer_id = $1::integer
+        AND node_id = $2::integer
+    ;
+  SQL
+  result = conn.exec_params(sql, [layer_id, node_id])
+  if result.cmd_tuples == 0
+    node_data_id = insert_route_node_data(
+      conn,
+      route,
+      layer_id,
+      node_id,
+      validity
+    )
+  else
+    node_data_id = result[0].fetch('id')
+    update_route_node_data(conn, route, node_data_id, validity)
+  end
+  node_data_id
+end
+
+
+def insert_route_node_data(conn, route, layer_id, node_id, validity)
+  sql = <<-SQL
+    INSERT
+      INTO node_data (
+        id,
+        node_id,
+        layer_id,
+        data,
+        modalities,
+        validity
+      )
+      VALUES (
+        $1::integer,   -- id
+        $2::integer,   -- node_id
+        $3::integer,   -- layer_id
+        $4::hstore,    -- data
+        $5::integer[], -- modalities
+        $6::tstzrange  -- validity
+      )
+    ;
+  SQL
+  node_data_id = get_next_value(conn, 'node_data_id_seq')
+  conn.exec_params(sql, [
+    node_data_id,
+    node_id,
+    layer_id,
+    hash_to_hstore(conn, route),
+    '{' + route.fetch('route_type') + '}',
+    validity
+  ])
+  node_data_id
+end
+
+
+def update_route_node_data(conn, route, node_data_id, validity)
+  sql = <<-SQL
+    UPDATE node_data
+      SET
+        data = $1::hstore,
+        modalities = $2::integer[],
+        validity = $3::tstzrange
+      WHERE id = $4::integer
+    ;
+  SQL
+
+  modality = route.fetch('route_type')
+  conn.exec_params(sql, [
+    hash_to_hstore(conn, route),
+    "{#{ modality }}",
+    validity,
+    node_data_id
+  ])
+end
+
+
+# = Helpers ====================================================================
+
+def get_modality_name_for_route(route)
+  modality = route.fetch('route_type').to_i
+  case modality
+  when 0 then 'tram'
+  when 1 then 'subway'
+  when 2 then 'rail'
+  when 3 then 'bus'
+  when 4 then 'ferry'
+  when 5 then 'cable car'
+  when 6 then 'gondola'
+  when 7 then 'funicular'
+  else fail "#{ modality } is not a modality."
   end
 end
 
-def do_cleanup(conn)
-  puts 'Cleaning up...'
 
-  puts 'Collecting old trips..'
-  conn.exec <<-SQL
-    SELECT
-      trip_id,
-      service_id
-    INTO TEMPORARY cu_tripids
-    FROM gtfs.trips
-    WHERE service_id in (
-      SELECT DISTINCT service_id
-      FROM gtfs.calendar_dates
-      WHERE date <= (now() - '2 days'::interval)
-    );
-  SQL
-
-  puts 'Removing still valid trips from collection...'
-  conn.exec <<-SQL
-    DELETE FROM cu_tripids
-    WHERE service_id IN (
-      SELECT DISTINCT service_id
-      FROM gtfs.calendar_dates
-      WHERE date > (now() - '2 days'::interval)
-    );
-  SQL
-
-  puts 'Deleting old stoptimes...'
-  conn.exec <<-SQL
-    DELETE FROM gtfs.stop_times
-    WHERE trip_id IN (
-      SELECT DISTINCT trip_id
-      FROM cu_tripids
-    );
-  SQL
-
-  puts 'Deleting obsolete trips...'
-  conn.exec <<-SQL
-    DELETE FROM gtfs.trips
-    WHERE trip_id IN (
-      SELECT DISTINCT trip_id
-      FROM cu_tripids
-    );
-  SQL
-
-  puts 'Deleting old calendar date entries...'
-  conn.exec <<-SQL
-    DELETE FROM gtfs.calendar_dates
-    WHERE DATE <= (now() - '2 days'::interval);
-  SQL
-end
-
-def main(argv)
-  opts = GetoptLong.new(
-    ['--prefix', '-p', GetoptLong::REQUIRED_ARGUMENT]
-  )
-
-  prefix = ''
-  opts.each do |opt, arg|
-    case opt
-      when '--prefix'
-        prefix = arg
-    end
-  end
-
-  database = argv[0]
-  user = argv[1]
-  password = argv[2]
-  data_dir = File.expand_path(argv[3])
-
-  unless File.directory?(data_dir)
-    puts "GTFS data directory missing, aborting"
-    return 1
-  end
-
-  unless database && user && password
-    puts "Database credentials missing, aborting"
-    return 1
-  end
-
-  optional = ['feed_info', 'shapes']
-
-  $gtfs_files.each do |name|
-    path = File.join(data_dir, "#{name}.txt")
-
-    unless File.exists?(path)
-      if optional.include?(name)
-        $gtfs_files.delete(name)
-      else
-        puts "Bad or incomplete GTFS data set in #{data_dir}, aborting!"
-        return 1
+def get_modalities_for_stop(conn, stop)
+  sql = 'SELECT DISTINCT type FROM gtfs.lines_for_stop($1::text);'
+  stop_id = stop.fetch('stop_id')
+  result = conn.exec_params(sql, [stop_id])
+  modalities = []
+  result.each do |line|
+    modality_name = line.fetch('type')
+    modality =
+      case modality_name
+      when 'Tram'      then 0
+      when 'Subway'    then 1
+      when 'Rail'      then 2
+      when 'Bus'       then 3
+      when 'Ferry'     then 4
+      when 'Cable car' then 5
+      when 'Gondola'   then 6
+      when 'Funicular' then 7
+      else fail "#{ modality_name } is not a modality name."
       end
-    end
+    modalities << modality
   end
-
-  conn = PGconn.new('localhost', '5432', nil, nil, database, user, password)
-
-  res = conn.exec("SELECT id FROM layers WHERE name = 'gtfs'");
-  if res.cmdtuples == 0
-    puts 'No GTFS layer found, aborting!'
-    return 1
-  end
-
-  layer_id = res[0]['id'].to_i
-
-  puts "Starting update: prefix: #{prefix}"
-  conn.transaction do
-    GTFS_Import::cons_calendartxt
-    copy_tables(conn, data_dir, prefix)
-  end
-
-  puts "\tCommitted copy gtfs."
-  conn.transaction do
-    do_cleanup(conn)
-  end
-
-  puts "\tCommitted cleanup."
-  conn.transaction do
-    do_stops(conn, layer_id, data_dir, prefix)
-    do_routes(conn, layer_id, data_dir, prefix)
-  end
-
-  puts 'Committed stops and routes mapping.'
-
-  return 0
-ensure
-  conn.close unless conn.nil?
+  modalities = modalities.join(',')
+  "{#{ modalities }}"
 end
+
+
+def get_next_value(conn, sequence_name)
+  result = conn.exec_params('SELECT nextval($1::regclass);', [sequence_name])
+  result[0].fetch('nextval').to_i
+end
+
+
+def hash_to_hstore(conn, hash)
+  escape = lambda { |obj| '"' + conn.escape(obj) + '"' }
+  pairs = []
+  hash.each_pair do |key, value|
+    next if value.nil?
+    key = escape.call(key)
+    value = escape.call(value)
+    pairs << "#{ key } => #{ value }"
+  end
+  pairs.join(',')
+end
+
 
 if __FILE__ == $0
-  exit main(ARGV)
+  exit main
 end
 

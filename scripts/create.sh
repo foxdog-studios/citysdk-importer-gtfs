@@ -2,6 +2,7 @@
 
 if [ $# != 2 ]; then
     echo 'Usage: create.sh USERNAME DATABASE' 1>&2
+    exit 1
 fi
 
 cd -- "`dirname "$0"`/.."
