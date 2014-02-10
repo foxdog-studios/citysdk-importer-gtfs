@@ -121,6 +121,7 @@ def download_and_import_gtfs(conn, uri, gtfs_id, gtfs_layer, last_modified)
       gtfs_dir = Pathname.new(gtfs_dir)
       extract_gtfs(archive, gtfs_dir)
       conn.transaction do
+        expand_ranges_and_apply_exceptions(gtfs_dir)
         import_gtfs_and_upsert_nodes(conn, gtfs_id, gtfs_dir, gtfs_layer)
         conn.exec_params(sql, [last_modified, gtfs_id])
       end # do
