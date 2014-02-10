@@ -178,6 +178,9 @@ ensure
 end # def
 
 def ensure_feed_exists(conn, gtfs_id)
+  sql = 'SELECT EXISTS (SELECT NULL FROM gtfs.feed WHERE gtfs_id = $1::text);'
+  result = conn.exec_params(sql, [gtfs_id])
+  return if result[0].fetch('exists') == 't'
   sql = 'INSERT INTO gtfs.feed (gtfs_id) VALUES ($1::text);'
   conn.exec_params(sql, [gtfs_id])
 end # def
@@ -317,11 +320,11 @@ class GTFSImporter
   end
 
   def import_calendar_dates
-    import('calendar_dates')
+    import('calendar_dates', file_name: 'calendar_dates.preprocessed.txt')
   end
 
   def import_feed_info
-    import('feed_info', optional = true)
+    import('feed_info', optional: true)
   end
 
   def import_routes
@@ -329,7 +332,7 @@ class GTFSImporter
   end
 
   def import_shapes
-    import('shapes', optional = true)
+    import('shapes', optional: true)
   end
 
   def import_stops
@@ -346,24 +349,23 @@ class GTFSImporter
 
   private
 
-  def import(name, optional = false)
-    path = @gtfs_dir.join("#{ name }.txt")
-    unless optional && !File.exists?(path)
-      Importer.new(@conn, @gtfs_id, path).import
-    end
-  end
-end
-
+  def import(base_table_name, options = {})
+    file_name = options.fetch(:file_name, "#{ base_table_name }.txt")
+    optional = options.fetch(:optional , false)
+    path = @gtfs_dir.join(file_name)
+    return if optional && !File.exists?(path)
+    importer = Importer.new(@conn, @gtfs_id, base_table_name, path)
+    importer.import
+  end # def
+end # class
 
 class Importer
-  def initialize(conn, gtfs_id, path)
+  def initialize(conn, gtfs_id, base_table_name, path)
     @conn = conn
     @gtfs_id = gtfs_id
     @path = path
-
-    base_name = path.basename(path.extname).to_s
-    @table_name = base_name
-    @tmp_table_name = 'tmp_' + base_name
+    @table_name = base_table_name
+    @tmp_table_name = 'tmp_' + base_table_name
     @tmp_columns = CSV.open(@path) { |csv| csv.shift }
   end
 
@@ -637,11 +639,29 @@ def upsert_route_nodes(conn, gtfs_id, layer_id)
   validity = nil
 
   if result.cmd_tuples > 0
-    tuple = result[0]
-    start_date = tuple.fetch('feed_start_date')
-    end_date = tuple.fetch('feed_end_date')
+    feed = result[0]
+
+    # TFGM uses the wrong field names. feed_(start|end)_data are the
+    # correct headers.
+
+    start_date_key =
+      if feed.key?('feed_valid_from')
+        'feed_valid_from'
+      else
+        'feed_start_date'
+      end # else
+
+    end_date_key =
+      if feed.key?('feed_valid_to')
+        'feed_valid_to'
+      else
+        'feed_end_date'
+      end # else
+
+    start_date = feed.fetch(start_date_key)
+    end_date = feed.fetch(end_date_key)
     validity = "[#{ start_date } 00:00, #{ end_date } 23:59]"
-  end
+  end # if
 
   result.clear
 
