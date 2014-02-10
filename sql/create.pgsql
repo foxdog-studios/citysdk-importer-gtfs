@@ -19,9 +19,13 @@ CREATE SCHEMA gtfs;
 
 -- CitySDK table
 CREATE TABLE gtfs.feed (
-    gtfs_id       TEXT PRIMARY KEY,
-    uri           TEXT NOT NULL UNIQUE,
-    last_imported TIMESTAMP WITH TIME ZONE
+    gtfs_id       text PRIMARY KEY,
+
+    -- If the feed is imported using the command line interface, there
+    -- will not be a URI. So, allow NULLs.
+    uri           text UNIQUE,
+
+    last_imported timestamp with time zone
 );
 
 
@@ -570,4 +574,19 @@ AS $$
     ORDER BY stop_sequence;
 $$ LANGUAGE SQL;
 
--- vi: filetype=pgsql
+
+-- -----------------------------------------------------------------------------
+-- - Permissions                                                               -
+-- -----------------------------------------------------------------------------
+
+-- XXX: Hard coded database and user name, pull out into configuration.
+GRANT TEMPORARY ON DATABASE citysdk TO citysdk;
+GRANT USAGE ON SCHEMA gtfs TO citysdk;
+GRANT SELECT ON ALL TABLES IN SCHEMA gtfs TO citysdk;
+GRANT INSERT ON ALL TABLES IN SCHEMA gtfs TO citysdk;
+GRANT UPDATE ON ALL TABLES IN SCHEMA gtfs TO citysdk;
+GRANT DELETE ON ALL TABLES IN SCHEMA gtfs TO citysdk;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA gtfs TO citysdk;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA gtfs TO citysdk;
+
+

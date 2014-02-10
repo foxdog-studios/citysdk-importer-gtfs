@@ -6,5 +6,5 @@ if [ $# != 2 ]; then
 fi
 
 cd -- "`dirname "$0"`/.."
-psql -U "$1" "$2" < sql/create.sql
+psql -U "$1" "$2" < sql/create.pgsql
 

@@ -53,7 +53,8 @@ def database_main(args, gtfs_layer)
     password: config.fetch('db_pass')
   )
 
-  conn.exec('SELECT * FROM gtfs.feed;').each do |feed|
+  sql = 'SELECT * FROM gtfs.feed WHERE uri IS NOT NULL;'
+  conn.exec(sql).each do |feed|
     uri = URI.parse(feed.fetch('uri'))
     gtfs_id = feed.fetch('gtfs_id')
     last_imported = feed.fetch('last_imported')
@@ -166,26 +167,27 @@ def cli_main(args)
     password: args.fetch('PASSWORD')
   )
 
+  gtfs_id = args.fetch('GTFS_ID')
+
   conn.transaction do
-    import_gtfs_and_upsert_nodes(
-      conn,
-      args.fetch('GTFS_ID'),
-      gtfs_dir,
-      'gtfs'
-    )
+    ensure_feed_exists(conn, gtfs_id)
+    import_gtfs_and_upsert_nodes(conn, gtfs_id, gtfs_dir, 'gtfs')
   end # do
 ensure
-  conn.close if defined? conn
+  conn.close unless conn.nil?
 end # def
 
+def ensure_feed_exists(conn, gtfs_id)
+  sql = 'INSERT INTO gtfs.feed (gtfs_id) VALUES ($1::text);'
+  conn.exec_params(sql, [gtfs_id])
+end # def
 
 def import_gtfs_and_upsert_nodes(conn, gtfs_id, gtfs_dir, gtfs_layer)
   conn.exec('SET search_path TO gtfs;')
   import_gtfs(conn, gtfs_id, gtfs_dir)
   conn.exec('SET search_path TO public;')
   upsert_nodes(conn, gtfs_id, gtfs_layer)
-end
-
+end # def
 
 # ==============================================================================
 # = Preprocess calendar                                                        =
@@ -483,14 +485,10 @@ def upsert_stop_node(conn, stop, layer_id)
   node_id
 end
 
-
 def insert_stop_node(conn, stop, layer_id, cdkid)
-  node_id = get_next_value(conn, 'nodes1_id_seq')
-
   sql = <<-SQL
     INSERT
       INTO nodes (
-        id,
         cdk_id,
         layer_id,
         node_type,
@@ -498,34 +496,32 @@ def insert_stop_node(conn, stop, layer_id, cdkid)
         geom
       )
       VALUES (
-        $1::integer, -- id
-        $2::text,    -- cdk_id
-        $3::integer, -- layer_id
+        $1::text,    -- cdk_id
+        $2::integer, -- layer_id
         2,           -- node_type
-        $4::text,    -- name
+        $3::text,    -- name
         ST_SetSRID(  -- geom
           ST_Point(
-            $5::double precision,
-            $6::double precision
+            $4::double precision,
+            $5::double precision
           ),
           4326
         )
       )
+      RETURNING id
     ;
   SQL
-
-  conn.exec_params(sql, [
-    node_id,
+  result = conn.exec_params(sql, [
     cdkid,
     layer_id,
     stop.fetch('stop_name'),
     stop.fetch('stop_lat'),
     stop.fetch('stop_lon')
   ])
-
-  node_id
-end
-
+  result[0].fetch('id')
+ensure
+  result.clear unless result.nil?
+end # def
 
 def update_stop_node(conn, stop, node_id)
   sql = <<-SQL
@@ -583,30 +579,29 @@ def insert_stop_node_data(conn, stop, layer_id, node_id)
   sql = <<-SQL
     INSERT
       INTO node_data (
-        id,
         layer_id,
         node_id,
         data,
         modalities
       )
       VALUES (
-        $1::integer,  -- id
-        $2::integer,  -- layer_id
-        $3::integer,  -- node_id
-        $4::hstore,   -- data
-        $5::integer[] -- modalities
+        $1::integer,  -- layer_id
+        $2::integer,  -- node_id
+        $3::hstore,   -- data
+        $4::integer[] -- modalities
       )
+      RETURNING id
     ;
   SQL
-  node_data_id = get_next_value(conn, 'node_data_id_seq')
-  conn.exec_params(sql, [
-    node_data_id,
+  result = conn.exec_params(sql, [
     layer_id,
     node_id,
     hash_to_hstore(conn, stop),
     get_modalities_for_stop(conn, stop)
   ])
-  node_data_id
+  result[0].fetch('id')
+ensure
+  result.clear unless result.nil?
 end
 
 
@@ -802,7 +797,6 @@ def insert_route_node(conn, layer_id, cdk_id, name, members, line)
   sql = <<-SQL
     INSERT
       INTO nodes (
-        id,
         name,
         cdk_id,
         layer_id,
@@ -811,26 +805,25 @@ def insert_route_node(conn, layer_id, cdk_id, name, members, line)
         geom
       )
       VALUES (
-        $1::integer,  -- id
-        $2::text,     -- name
-        $3::text,     -- cdk_id
-        $4::integer,  -- layer_id
+        $1::text,     -- name
+        $2::text,     -- cdk_id
+        $3::integer,  -- layer_id
         3,            -- node_type
-        $5::bigint[], -- members
+        $4::bigint[], -- members
         #{ line }     -- geom
       )
+      RETURNING id
     ;
   SQL
-
-  route_node_id = get_next_value(conn, 'nodes1_id_seq')
-  conn.exec_params(sql, [
-    route_node_id,
+  result = conn.exec_params(sql, [
     name,
     cdk_id,
     layer_id,
     members,
   ])
-  route_node_id
+  result[0].fetch('id')
+ensure
+  result.clear unless result.nil?
 end
 
 
@@ -878,7 +871,6 @@ def insert_route_node_data(conn, route, layer_id, node_id, validity)
   sql = <<-SQL
     INSERT
       INTO node_data (
-        id,
         node_id,
         layer_id,
         data,
@@ -886,25 +878,23 @@ def insert_route_node_data(conn, route, layer_id, node_id, validity)
         validity
       )
       VALUES (
-        $1::integer,   -- id
-        $2::integer,   -- node_id
-        $3::integer,   -- layer_id
-        $4::hstore,    -- data
-        $5::integer[], -- modalities
-        $6::tstzrange  -- validity
+        $1::integer,   -- node_id
+        $2::integer,   -- layer_id
+        $3::hstore,    -- data
+        $4::integer[], -- modalities
+        $5::tstzrange  -- validity
       )
+      RETURNING id
     ;
   SQL
-  node_data_id = get_next_value(conn, 'node_data_id_seq')
-  conn.exec_params(sql, [
-    node_data_id,
+  result = conn.exec_params(sql, [
     node_id,
     layer_id,
     hash_to_hstore(conn, route),
     '{' + route.fetch('route_type') + '}',
     validity
   ])
-  node_data_id
+  result[0].fetch('id')
 end
 
 
@@ -970,14 +960,7 @@ def get_modalities_for_stop(conn, stop)
   end
   modalities = modalities.join(',')
   "{#{ modalities }}"
-end
-
-
-def get_next_value(conn, sequence_name)
-  result = conn.exec_params('SELECT nextval($1::regclass);', [sequence_name])
-  result[0].fetch('nextval').to_i
-end
-
+end # def
 
 def hash_to_hstore(conn, hash)
   escape = lambda { |obj| '"' + conn.escape(obj) + '"' }
@@ -989,8 +972,7 @@ def hash_to_hstore(conn, hash)
     pairs << "#{ key } => #{ value }"
   end
   pairs.join(',')
-end
-
+end # def
 
 if __FILE__ == $0
   exit main
