@@ -388,12 +388,9 @@ class Importer
     columns = make_columns
     @conn.exec <<-SQL
       CREATE TEMPORARY TABLE #{ @tmp_table_name }
-        ON COMMIT DROP
-        AS (
-          SELECT #{ columns } FROM #{ @table_name }
-        )
-        WITH NO DATA
-      ;
+      ON COMMIT DROP
+      AS (SELECT #{ columns } FROM #{ @table_name })
+      WITH NO DATA;
     SQL
   end
 
@@ -504,8 +501,8 @@ def insert_stop_node(conn, stop, layer_id, cdkid)
         $3::text,    -- name
         ST_SetSRID(  -- geom
           ST_Point(
-            $4::double precision,
-            $5::double precision
+            $4::double precision, -- x_lon
+            $5::double precision  -- y_lat
           ),
           4326
         )
@@ -517,8 +514,8 @@ def insert_stop_node(conn, stop, layer_id, cdkid)
     cdkid,
     layer_id,
     stop.fetch('stop_name'),
-    stop.fetch('stop_lat'),
-    stop.fetch('stop_lon')
+    stop.fetch('stop_lon'),
+    stop.fetch('stop_lat')
   ])
   result[0].fetch('id')
 ensure
@@ -532,8 +529,8 @@ def update_stop_node(conn, stop, node_id)
         name = $1::text,
         geom = ST_SetSRID(
           ST_Point(
-            $2::double precision,
-            $3::double precision
+            $2::double precision, -- x_lon
+            $3::double precision  -- y_lat
           ),
           4326
         )
@@ -543,8 +540,8 @@ def update_stop_node(conn, stop, node_id)
 
   conn.exec_params(sql, [
     stop.fetch('stop_name'),
-    stop.fetch('stop_lat'),
     stop.fetch('stop_lon'),
+    stop.fetch('stop_lat'),
     node_id
   ])
 end
