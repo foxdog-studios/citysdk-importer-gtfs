@@ -127,7 +127,7 @@ CREATE TABLE gtfs.trips (
     service_id            TEXT NOT NULL,
     trip_id               TEXT NOT NULL,
     trip_headsign         TEXT,
-    direction_id          SMALLINT,
+    direction_id          SMALLINT NOT NULL DEFAULT 0,
     wheelchair_accessible SMALLINT,
     trip_bikes_allowed    SMALLINT,
     block_id              TEXT,
