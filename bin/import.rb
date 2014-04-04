@@ -372,11 +372,16 @@ class Importer
   def import
     puts "Importing #{ @table_name }..."
 
+    puts 'creating temporary table'
     create_tmp_table
-    copies = copy_csv.cmd_tuples
+    puts 'copying csv'
+    copies = copy_csv().cmd_tuples
+    puts 'locking table'
     lock_table
-    deletes = delete_rows.cmd_tuples
-    inserts = insert_rows.cmd_tuples
+    puts 'Deleting old rows'
+    deletes = delete_rows().cmd_tuples
+    puts 'Inserting new rows'
+    inserts = insert_rows().cmd_tuples
 
     puts "Imported #{@table_name} (#{copies} copies, #{deletes} deletes, " \
          "#{inserts} inserts)"
