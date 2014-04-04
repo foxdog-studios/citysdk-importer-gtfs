@@ -685,8 +685,9 @@ def upsert_route_nodes(conn, gtfs_id, layer_id)
       route.fetch('route_long_name')
     ].join('; ')
 
-    upsert_route(conn, gtfs_id, layer_id, route, 0, validity)
-    upsert_route(conn, gtfs_id, layer_id, route, 1, validity)
+    [0, 1, nil].each do |direction|
+        upsert_route(conn, gtfs_id, layer_id, route, direction, validity)
+    end
 
     num_routes_to_add -= 1
   end # do

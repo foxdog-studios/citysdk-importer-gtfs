@@ -127,9 +127,7 @@ CREATE TABLE gtfs.trips (
     service_id            TEXT NOT NULL,
     trip_id               TEXT NOT NULL,
     trip_headsign         TEXT,
-    -- XXX: direction_id is optional, put default direction as zero, so route
-    -- creation code works.
-    direction_id          SMALLINT NOT NULL DEFAULT 0,
+    direction_id          SMALLINT,
     wheelchair_accessible SMALLINT,
     trip_bikes_allowed    SMALLINT,
     block_id              TEXT,
