@@ -190,7 +190,9 @@ def import_gtfs_and_upsert_nodes(conn, gtfs_id, gtfs_dir, gtfs_layer)
   import_gtfs(conn, gtfs_id, gtfs_dir)
   conn.exec('SET search_path TO public;')
   upsert_nodes(conn, gtfs_id, gtfs_layer)
+  update_layer_bounds(conn, gtfs_layer)
 end # def
+
 
 # ==============================================================================
 # = Preprocess calendar                                                        =
@@ -366,25 +368,28 @@ class Importer
     @path = path
     @table_name = base_table_name
     @tmp_table_name = 'tmp_' + base_table_name
-    @tmp_columns = CSV.open(@path) { |csv| csv.shift }
+    @tmp_columns = CSV.open(@path) { |csv| csv.shift() }
   end
 
-  def import
+  def import()
     puts "Importing #{ @table_name }..."
 
-    puts 'creating temporary table'
-    create_tmp_table
-    puts 'copying csv'
+    puts "\tCreating temporary table"
+    create_tmp_table()
+
+    puts "\tCopying csv"
     copies = copy_csv().cmd_tuples
-    puts 'locking table'
-    lock_table
-    puts 'Deleting old rows'
+
+    puts "\tLocking table"
+    lock_table()
+
+    puts "\tDeleting old rows"
     deletes = delete_rows().cmd_tuples
-    puts 'Inserting new rows'
+
+    puts "\tInserting new rows"
     inserts = insert_rows().cmd_tuples
 
-    puts "Imported #{@table_name} (#{copies} copies, #{deletes} deletes, " \
-         "#{inserts} inserts)"
+    puts "\t#{ copies } copies, #{ deletes } deletes, #{ inserts } inserts"
   end
 
   private
@@ -940,6 +945,15 @@ def update_route_node_data(conn, route, node_data_id, validity)
     node_data_id
   ])
 end
+
+def update_layer_bounds(conn, layer_name)
+  sql = 'SELECT update_layer_bounds($1::integer);'
+  layer_id = find_layer_id_from_name(conn, layer_name)
+  result = conn.exec_params(sql, [layer_id])
+  return # nothing
+ensure
+  result.clear() unless result.nil?
+end # ensure
 
 
 # = Helpers ====================================================================
